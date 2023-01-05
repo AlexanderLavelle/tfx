@@ -32,8 +32,6 @@ from tfx.types import standard_artifacts
 from tfx.utils import test_case_utils as tu
 from ml_metadata.proto import metadata_store_pb2
 
-State = metadata_store_pb2.Execution.State
-
 
 class TaskGenUtilsTest(parameterized.TestCase, tu.TfxTest):
 
@@ -113,60 +111,6 @@ class TaskGenUtilsTest(parameterized.TestCase, tu.TfxTest):
       self.assertCountEqual(all_transform_execs[1:],
                             task_gen_utils.get_executions(m, self._transform))
       self.assertEmpty(task_gen_utils.get_executions(m, self._trainer))
-
-  def test_get_executions_only_active(self):
-    with self._mlmd_connection as m:
-      for node in [n.pipeline_node for n in self._pipeline.nodes]:
-        self.assertEmpty(task_gen_utils.get_executions(m, node))
-
-    # Create executions for the same nodes under different pipeline contexts.
-    self._set_pipeline_context(self._pipeline, 'pipeline', 'my_pipeline1')
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.NEW)
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.RUNNING)
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.COMPLETE)
-    otu.fake_component_output(self._mlmd_connection, self._transform)
-    self._set_pipeline_context(self._pipeline, 'pipeline', 'my_pipeline2')
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.NEW)
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.RUNNING)
-    otu.fake_example_gen_execution_with_state(self._mlmd_connection,
-                                              self._example_gen, State.COMPLETE)
-    otu.fake_component_output(self._mlmd_connection, self._transform)
-
-    # Get all ExampleGen executions across all pipeline contexts.
-    with self._mlmd_connection as m:
-      all_eg_execs = sorted(
-          m.store.get_executions_by_type(self._example_gen.node_info.type.name),
-          key=lambda e: e.id)
-      active_eg_execs = [
-          execution for execution in all_eg_execs
-          if execution.last_known_state == State.RUNNING or
-          execution.last_known_state == State.NEW
-      ]
-
-    # Check that correct executions are returned for each node in each pipeline.
-    self._set_pipeline_context(self._pipeline, 'pipeline', 'my_pipeline1')
-    with self._mlmd_connection as m:
-      self.assertCountEqual(
-          active_eg_execs[0:2],
-          task_gen_utils.get_executions(m, self._example_gen, only_active=True))
-      self.assertEmpty(
-          task_gen_utils.get_executions(m, self._transform, only_active=True))
-      self.assertEmpty(
-          task_gen_utils.get_executions(m, self._trainer, only_active=True))
-    self._set_pipeline_context(self._pipeline, 'pipeline', 'my_pipeline2')
-    with self._mlmd_connection as m:
-      self.assertCountEqual(
-          active_eg_execs[2:],
-          task_gen_utils.get_executions(m, self._example_gen, only_active=True))
-      self.assertEmpty(
-          task_gen_utils.get_executions(m, self._transform, only_active=True))
-      self.assertEmpty(
-          task_gen_utils.get_executions(m, self._trainer, only_active=True))
 
   def test_generate_task_from_active_execution(self):
     with self._mlmd_connection as m:
@@ -446,7 +390,7 @@ class TaskGenUtilsTest(parameterized.TestCase, tu.TfxTest):
         task_gen_utils.get_num_of_failures_from_failed_execution(
             executions, failed_execution))
 
-  def test_register_execution_from_existing_execution(self):
+  def test_register_retry_executions(self):
     with self._mlmd_connection as m:
       # Put contexts.
       context_type = metadata_store_pb2.ContextType(name='my_ctx_type')
@@ -483,15 +427,11 @@ class TaskGenUtilsTest(parameterized.TestCase, tu.TfxTest):
           input_artifacts=input_and_param.input_artifacts)
 
       # Register a retry execution from a failed execution.
-      [retry_execution] = (
-          task_gen_utils.register_executions_from_existing_executions(
-              m, self._example_gen, [failed_execution]
-          )
-      )
+      retry_execution = task_gen_utils.register_retry_execution(
+          m, self._example_gen, failed_execution)
 
-      self.assertEqual(
-          retry_execution.last_known_state, metadata_store_pb2.Execution.NEW
-      )
+      self.assertEqual(retry_execution.last_known_state,
+                       metadata_store_pb2.Execution.RUNNING)
       self.assertEqual(
           retry_execution.custom_properties[task_gen_utils._EXECUTION_SET_SIZE],
           failed_execution.custom_properties[
@@ -542,64 +482,6 @@ class TaskGenUtilsTest(parameterized.TestCase, tu.TfxTest):
       self.assertEqual('my_type', artifact_types_in_local[0].name)
       # artifact should have the new type id.
       self.assertEqual(artifact_types_in_local[0].id, artifact_pb.type_id)
-
-  def test_get_unprocessed_inputs(self):
-    with self._mlmd_connection as m:
-      # Prepare context.
-      context_type = metadata_store_pb2.ContextType(name='ctx_type')
-      context_type_id = m.store.put_context_type(context_type)
-      context = metadata_store_pb2.Context(name='ctx', type_id=context_type_id)
-      m.store.put_contexts([context])
-
-      # Prepare artifact.
-      artifact_type = metadata_store_pb2.ArtifactType(name='a_type')
-      artifact_type.id = m.store.put_artifact_type(artifact_type)
-      artifact_pb = metadata_store_pb2.Artifact(type_id=artifact_type.id)
-      artifact_pb.id = m.store.put_artifacts([artifact_pb])[0]
-      artifact = artifact_utils.deserialize_artifacts(
-          artifact_type, [artifact_pb]
-      )
-
-      with self.subTest(name='NoInput'):
-        # There is no input.
-        resolved_info = task_gen_utils.ResolvedInfo(
-            contexts=[context], input_and_params=[]
-        )
-        unprocessed_inputs = task_gen_utils.get_unprocessed_inputs(
-            m, [], resolved_info
-        )
-        self.assertEmpty(unprocessed_inputs)
-
-      with self.subTest(name='OneUnprocessedInput'):
-        # There is 1 unprocessed_input
-        input_and_param = task_gen_utils.InputAndParam(
-            input_artifacts={'examples': artifact}
-        )
-        resolved_info = task_gen_utils.ResolvedInfo(
-            contexts=[context],
-            input_and_params=[input_and_param],
-        )
-        unprocessed_inputs = task_gen_utils.get_unprocessed_inputs(
-            m, [], resolved_info
-        )
-        self.assertLen(unprocessed_inputs, 1)
-        self.assertEqual(unprocessed_inputs[0], input_and_param)
-
-      with self.subTest(name='OnePprocessedInput'):
-        # Simulate that the input artifact is processed.
-        execution = execution_lib.prepare_execution(
-            m,
-            execution_type=metadata_store_pb2.ExecutionType(name='my_ex_type'),
-            state=metadata_store_pb2.Execution.COMPLETE,
-        )
-        execution = execution_lib.put_execution(
-            m, execution, [context], input_artifacts={'examples': artifact}
-        )
-        unprocessed_inputs = task_gen_utils.get_unprocessed_inputs(
-            m, [execution], resolved_info
-        )
-        self.assertEmpty(unprocessed_inputs)
-
 
 if __name__ == '__main__':
   tf.test.main()

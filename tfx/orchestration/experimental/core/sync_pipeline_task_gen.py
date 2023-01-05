@@ -289,17 +289,16 @@ class _Generator:
         result.append(
             self._update_node_state_to_failed_task(
                 node_uid=node_uid, error_msg=error_msg))
+        return result
       elif (node.execution_options.max_execution_retries >=
             task_gen_utils.get_num_of_failures_from_failed_execution(
                 node_executions, failed_executions[0])):
-        [retry_execution] = (
-            task_gen_utils.register_executions_from_existing_executions(
-                self._mlmd_handle, node, failed_executions
-            )
-        )
+        retry_execution = task_gen_utils.register_retry_execution(
+            self._mlmd_handle, node, failed_executions[0])
         result.extend(
             self._generate_tasks_from_existing_execution(retry_execution, node))
-      else:
+        return result
+      elif node_state.state != pstate.NodeState.STARTING:
         error_msg = failed_executions[0].custom_properties.get(
             constants.EXECUTION_ERROR_MSG_KEY)
         error_msg = data_types_utils.get_metadata_value(
@@ -308,7 +307,7 @@ class _Generator:
         result.append(
             self._update_node_state_to_failed_task(
                 node_uid=node_uid, error_msg=error_msg))
-      return result
+        return result
 
     # TODO(b/223627713): a node in a ForEach is not restartable, we fail the
     # node for now. Will fix this in a separate CL.

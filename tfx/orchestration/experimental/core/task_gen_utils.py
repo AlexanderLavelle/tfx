@@ -233,9 +233,7 @@ def generate_resolved_info(
 
 def get_executions(
     metadata_handler: metadata.Metadata,
-    node: node_proto_view.NodeProtoView,
-    only_active: bool = False,
-) -> List[metadata_store_pb2.Execution]:
+    node: node_proto_view.NodeProtoView) -> List[metadata_store_pb2.Execution]:
   """Returns all executions for the given pipeline node.
 
   This finds all executions having the same set of contexts as the pipeline
@@ -244,9 +242,6 @@ def get_executions(
   Args:
     metadata_handler: A handler to access MLMD db.
     node: The pipeline node for which to obtain executions.
-    only_active: If set to true, only active executions are returned. Otherwise,
-      all executions are returned. Active executions mean executions with NEW or
-      RUNNING last_known_state.
 
   Returns:
     List of executions for the given node in MLMD db.
@@ -262,17 +257,12 @@ def get_executions(
         f"(contexts_{i}.type = '{context_type}' AND contexts_{i}.name = '{context_name}')"
     )
   filter_query = ' AND '.join(contexts)
-  if only_active:
-    active_state_filter_query = (
-        '(last_known_state = NEW OR last_known_state = RUNNING)'
-    )
-    filter_query = ' AND '.join([filter_query, active_state_filter_query])
   return metadata_handler.store.get_executions(
       list_options=mlmd.ListOptions(filter_query=filter_query))
 
 
 def get_latest_executions_set(
-    executions: Iterable[metadata_store_pb2.Execution],
+    executions: Iterable[metadata_store_pb2.Execution]
 ) -> List[metadata_store_pb2.Execution]:  # pylint: disable=g-doc-args
   """Returns latest set of executions, ascendingly ordered by __external_execution_index__.
 
@@ -390,63 +380,49 @@ def get_executor_spec(pipeline: pipeline_pb2.Pipeline,
   return depl_config.executor_specs.get(node_id)
 
 
-def register_executions_from_existing_executions(
+def register_retry_execution(
     metadata_handle: metadata.Metadata,
     node: node_proto_view.NodeProtoView,
-    existing_executions: List[metadata_store_pb2.Execution],
-) -> Sequence[metadata_store_pb2.Execution]:
-  """Registers a list of new executions from a list of failed/canceled executions."""
-  if not existing_executions:
-    return []
-
+    failed_execution: metadata_store_pb2.Execution
+) -> metadata_store_pb2.Execution:
+  """Generates a retry execution from a failed execution and put it in MLMD."""
+  # Set a new execution name and put the state to RUNNING.
   exec_properties = resolve_exec_properties(node)
-  new_executions = []
-  input_artifacts = []
-  for existing_execution in existing_executions:
-    # TODO(b/224800273): We also need to resolve and set dynamic execution
-    # properties.
-    new_execution = execution_lib.prepare_execution(
-        metadata_handler=metadata_handle,
-        execution_type=node.node_info.type,
-        state=metadata_store_pb2.Execution.NEW,
-        exec_properties=exec_properties,
-        execution_name=str(uuid.uuid4()),
-    )
-    # Only copy necessary custom_properties from the failed/canceled execution.
-    # LINT.IfChange(new_execution_custom_properties)
-    new_execution.custom_properties[_EXECUTION_SET_SIZE].CopyFrom(
-        existing_execution.custom_properties[_EXECUTION_SET_SIZE]
-    )
-    new_execution.custom_properties[_EXECUTION_TIMESTAMP].CopyFrom(
-        existing_execution.custom_properties[_EXECUTION_TIMESTAMP]
-    )
-    new_execution.custom_properties[_EXTERNAL_EXECUTION_INDEX].CopyFrom(
-        existing_execution.custom_properties[_EXTERNAL_EXECUTION_INDEX]
-    )
-    # LINT.ThenChange(:execution_custom_properties)
-    new_executions.append(new_execution)
-    input_artifacts.append(
-        execution_lib.get_input_artifacts(
-            metadata_handle, existing_execution.id
-        )
-    )
+  # TODO(b/224800273): We also need to resolve and set dynamic execution
+  # properties.
+  retry_execution = execution_lib.prepare_execution(
+      metadata_handler=metadata_handle,
+      execution_type=node.node_info.type,
+      state=metadata_store_pb2.Execution.RUNNING,
+      exec_properties=exec_properties,
+      execution_name=str(uuid.uuid4()))
+  # Only copy necessary custom_properties from the failed execution.
+  # LINT.IfChange(retry_execution_custom_properties)
+  retry_execution.custom_properties[_EXECUTION_SET_SIZE].CopyFrom(
+      failed_execution.custom_properties[_EXECUTION_SET_SIZE])
+  retry_execution.custom_properties[_EXECUTION_TIMESTAMP].CopyFrom(
+      failed_execution.custom_properties[_EXECUTION_TIMESTAMP])
+  retry_execution.custom_properties[_EXTERNAL_EXECUTION_INDEX].CopyFrom(
+      failed_execution.custom_properties[
+          _EXTERNAL_EXECUTION_INDEX])
+  # LINT.ThenChange(:execution_custom_properties)
 
   contexts = metadata_handle.store.get_contexts_by_execution(
-      existing_executions[0].id
-  )
-  return execution_lib.put_executions(
+      failed_execution.id)
+  input_artifacts = execution_lib.get_input_artifacts(
+      metadata_handle, failed_execution.id)
+  return execution_lib.put_execution(
       metadata_handle,
-      new_executions,
+      retry_execution,
       contexts,
-      input_artifacts_maps=input_artifacts,
-  )
+      input_artifacts=input_artifacts)
 
 
 def register_executions(
     metadata_handler: metadata.Metadata,
     execution_type: metadata_store_pb2.ExecutionType,
     contexts: Sequence[metadata_store_pb2.Context],
-    input_and_params: List[InputAndParam],
+    input_and_params: List[InputAndParam]
 ) -> Sequence[metadata_store_pb2.Execution]:
   """Registers multiple executions in MLMD.
 
@@ -482,7 +458,7 @@ def register_executions(
     execution.custom_properties[_EXECUTION_TIMESTAMP].int_value = timestamp
     execution.custom_properties[_EXTERNAL_EXECUTION_INDEX].int_value = index
     executions.append(execution)
-  # LINT.ThenChange(:new_execution_custom_properties)
+  # LINT.ThenChange(:retry_execution_custom_properties)
 
   if len(executions) == 1:
     return [
@@ -524,74 +500,3 @@ def update_external_artifact_type(local_mlmd_handle: metadata.Metadata,
       local_artifact_type_id = local_type_id_by_name[type_name]
       artifact.type_id = local_artifact_type_id
       artifact.artifact_type.id = local_artifact_type_id
-
-
-def get_unprocessed_inputs(
-    metadata_handle: metadata.Metadata,
-    executions: Sequence[metadata_store_pb2.Execution],
-    resolved_info: ResolvedInfo,
-) -> List[InputAndParam]:
-  """Get a list of unprocessed input from resolved_info.
-
-  Args:
-    metadata_handle: A handle to access local MLMD db.
-    executions: A list of executions
-    resolved_info: Resolved input of a node. It may contain processed and
-      unprocessed input.
-
-  Returns:
-    A list of InputAndParam that have not been processed.
-  """
-  processed_artifact_ids_by_execution: Dict[str, set[int]] = {}
-  for execution in executions:
-    artifact_ids_by_event_type = (
-        execution_lib.get_artifact_ids_by_event_type_for_execution_id(
-            metadata_handle, execution.id
-        )
-    )
-    # TODO(b/250075208) Support notrigger, trigger_by, etc.
-    processed_artifact_ids_by_execution[execution.id] = (
-        artifact_ids_by_event_type.get(metadata_store_pb2.Event.INPUT, set())
-    )
-
-  unprocessed_inputs = []
-  for input_and_param in resolved_info.input_and_params:
-    resolved_input_ids = set()
-    resolved_input_external_ids = set()
-    for artifact in itertools.chain(*input_and_param.input_artifacts.values()):
-      if artifact.id:
-        resolved_input_ids.add(artifact.id)
-      elif artifact.mlmd_artifact.external_id:
-        resolved_input_external_ids.add(artifact.mlmd_artifact.external_id)
-
-    # If the resolved inputs are from different pipelines, we use the field
-    # external_id to get their ids in local db.
-    artifact_ids_by_external_ids: Dict[str, int] = {}
-    if resolved_input_external_ids:
-      try:
-        for a in metadata_handle.store.get_artifacts_by_external_ids(
-            external_ids=resolved_input_external_ids
-        ):
-          artifact_ids_by_external_ids[a.external_id] = a.id
-      except errors.NotFoundError:
-        pass
-      except Exception as e:  # pylint:disable=broad-except
-        logging.exception(
-            'Error when getting artifacts by external ids. Error: %s', e
-        )
-        return []
-
-      if len(artifact_ids_by_external_ids) == len(resolved_input_external_ids):
-        resolved_input_ids.update(artifact_ids_by_external_ids.keys())
-      else:
-        # Adding -1 indicates that some resolved artifacts are from external
-        # pipelines and they have not been processed yet.
-        resolved_input_ids.add(-1)
-
-    for processed_ids in processed_artifact_ids_by_execution.values():
-      if processed_ids == resolved_input_ids:
-        break
-    else:
-      unprocessed_inputs.append(input_and_param)
-
-  return unprocessed_inputs

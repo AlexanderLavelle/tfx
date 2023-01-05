@@ -20,12 +20,11 @@ import time
 import uuid
 
 from absl.testing import flagsaver
-from absl.testing import parameterized
 import tensorflow as tf
 from tfx.dsl.compiler import constants
+from tfx.orchestration.experimental.core import mlmd_state
 from tfx.orchestration.experimental.core import pipeline_state as pstate
 from tfx.orchestration.experimental.core import sync_pipeline_task_gen as sptg
-from tfx.orchestration.experimental.core import task as task_lib
 from tfx.orchestration.experimental.core import task_queue as tq
 from tfx.orchestration.experimental.core import task_scheduler as ts
 from tfx.orchestration.experimental.core import test_utils
@@ -38,7 +37,7 @@ from tfx.utils import status as status_lib
 from ml_metadata.proto import metadata_store_pb2
 
 
-class SubpipelineTaskSchedulerTest(test_utils.TfxTest, parameterized.TestCase):
+class SubpipelineTaskSchedulerTest(test_utils.TfxTest):
 
   def setUp(self):
     super().setUp()
@@ -69,6 +68,17 @@ class SubpipelineTaskSchedulerTest(test_utils.TfxTest, parameterized.TestCase):
             constants.PIPELINE_RUN_ID_PARAMETER_NAME: pipeline_run_id,
         })
     return pipeline
+
+  def _get_orchestrator_executions(self):
+    """Returns all the executions with '__ORCHESTRATOR__' execution type."""
+    with self._mlmd_connection as m:
+      executions = m.store.get_executions()
+      result = []
+      for e in executions:
+        [execution_type] = m.store.get_execution_types_by_id([e.type_id])
+        if execution_type.name == pstate._ORCHESTRATOR_RESERVED_ID:  # pylint: disable=protected-access
+          result.append(e)
+    return result
 
   def test_subpipeline_ir_rewrite(self):
     old_ir = copy.deepcopy(self._sub_pipeline.raw_proto())
@@ -109,14 +119,8 @@ class SubpipelineTaskSchedulerTest(test_utils.TfxTest, parameterized.TestCase):
           self.assertIn(new_run_id, pipeline_run_context_names)
           self.assertNotIn(old_run_id, pipeline_run_context_names)
 
-  @parameterized.named_parameters(
-      dict(testcase_name='run_till_finish', cancel_pipeline=False),
-      dict(testcase_name='run_and_cancel', cancel_pipeline=True)
-  )
   @flagsaver.flagsaver(subpipeline_scheduler_polling_interval_secs=1.0)
-  def test_subpipeline_task_scheduler(self, cancel_pipeline):
-    sleep_time = subpipeline_task_scheduler._POLLING_INTERVAL_SECS.value * 5
-
+  def test_subpipeline_task_scheduler(self):
     with self._mlmd_connection as mlmd_connection:
       test_utils.fake_example_gen_run(mlmd_connection, self._example_gen, 1, 1)
 
@@ -140,73 +144,42 @@ class SubpipelineTaskSchedulerTest(test_utils.TfxTest, parameterized.TestCase):
               'my_sub_pipeline.my_sub_pipeline'
           ])
 
-      # There should be only 1 orchestrator execution for the outer pipeline.
-      pipeline_states = pstate.PipelineState.load_all_active(mlmd_connection)
-      self.assertLen(pipeline_states, 1)
-
       ts_result = []
-      scheduler = subpipeline_task_scheduler.SubPipelineTaskScheduler(
-          mlmd_handle=mlmd_connection,
-          pipeline=self._pipeline,
-          task=sub_pipeline_task,
-      )
 
       def start_scheduler(ts_result):
-        ts_result.append(scheduler.schedule())
+        ts_result.append(
+            subpipeline_task_scheduler.SubPipelineTaskScheduler(
+                mlmd_handle=mlmd_connection,
+                pipeline=self._pipeline,
+                task=sub_pipeline_task).schedule())
+
+      # There should be only 1 orchestrator execution for the outer pipeline.
+      self.assertLen(self._get_orchestrator_executions(), 1)
+
+      # Shortens the polling interval during test.
       threading.Thread(target=start_scheduler, args=(ts_result,)).start()
 
       # Wait for sometime for the update to go through.
-      time.sleep(sleep_time)
-
-      # There should be another orchestrator execution for the inner pipeline.
-      pipeline_states = pstate.PipelineState.load_all_active(mlmd_connection)
-      self.assertLen(pipeline_states, 2)
-      subpipeline_state = pstate.PipelineState.load(
-          mlmd_connection, task_lib.PipelineUid(pipeline_id='my_sub_pipeline')
-      )
+      time.sleep(subpipeline_task_scheduler._POLLING_INTERVAL_SECS.value * 5)
 
       # The scheduler is still waiting for subpipeline to finish.
-      self.assertEmpty(ts_result)
+      self.assertEqual(len(ts_result), 0)
+      # There should be another orchestrator execution for the inner pipeline.
+      orchestrator_executions = self._get_orchestrator_executions()
+      self.assertLen(orchestrator_executions, 2)
 
-      if cancel_pipeline:
-        # Call cancel() to initiate the cancel.
-        scheduler.cancel(
-            task_lib.CancelNodeTask(
-                node_uid=task_lib.NodeUid.from_node(
-                    self._pipeline,
-                    self._sub_pipeline,
-                )
-            )
-        )
+      # Mark inner pipeline as COMPLETE.
+      with mlmd_state.mlmd_execution_atomic_op(
+          mlmd_handle=mlmd_connection,
+          execution_id=orchestrator_executions[1].id) as execution:
+        execution.last_known_state = metadata_store_pb2.Execution.COMPLETE
 
-        # Sets the cancel state on subpipeline.
-        def _cancel(pipeline_state):
-          time.sleep(2.0)
-          with pipeline_state:
-            if pipeline_state.is_stop_initiated():
-              pipeline_state.set_pipeline_execution_state(
-                  metadata_store_pb2.Execution.CANCELED)
-        threading.Thread(target=_cancel, args=(subpipeline_state,)).start()
+      # Wait for the update to go through.
+      time.sleep(subpipeline_task_scheduler._POLLING_INTERVAL_SECS.value * 5)
 
-        # Wait for the update to go through.
-        time.sleep(sleep_time)
-
-        self.assertLen(ts_result, 1)
-        self.assertEqual(status_lib.Code.CANCELLED, ts_result[0].status.code)
-      else:
-        # Mark inner pipeline as COMPLETE.
-        def _complete(pipeline_state):
-          with pipeline_state:
-            pipeline_state.set_pipeline_execution_state(
-                metadata_store_pb2.Execution.COMPLETE)
-        threading.Thread(target=_complete, args=(subpipeline_state,)).start()
-
-        # Wait for the update to go through.
-        time.sleep(sleep_time)
-
-        self.assertLen(ts_result, 1)
-        self.assertEqual(status_lib.Code.OK, ts_result[0].status.code)
-        self.assertIsInstance(ts_result[0].output, ts.ExecutorNodeOutput)
+      self.assertEqual(len(ts_result), 1)
+      self.assertEqual(status_lib.Code.OK, ts_result[0].status.code)
+      self.assertIsInstance(ts_result[0].output, ts.ExecutorNodeOutput)
 
 
 if __name__ == '__main__':

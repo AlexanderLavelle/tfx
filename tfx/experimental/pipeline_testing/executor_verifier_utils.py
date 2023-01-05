@@ -268,8 +268,6 @@ def compare_model_file_sizes(output_uri: str, expected_uri: str,
 def compare_anomalies(output_uri: str, expected_uri: str) -> bool:
   """Compares anomalies files in output uri and recorded uri.
 
-  Looks at only binary proto files.
-
   Args:
     output_uri: pipeline output artifact uri.
     expected_uri: recorded pipeline output artifact uri.
@@ -279,9 +277,6 @@ def compare_anomalies(output_uri: str, expected_uri: str) -> bool:
   """
   for dir_name, _, leaf_files in fileio.walk(expected_uri):
     for leaf_file in leaf_files:
-      if not leaf_file.endswith('.pb'):
-        # Do not analyze non-binary-proto files.
-        continue
       expected_file_name = os.path.join(dir_name, leaf_file)
       file_name = os.path.join(
           dir_name.replace(expected_uri, output_uri, 1), leaf_file)
