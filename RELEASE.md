@@ -4,6 +4,8 @@
 
 ## Breaking Changes
 
+*   `placeholder.Predicate.from_comparison()` removed (was deprecated)
+
 ### For Pipeline Authors
 
 ### For Component Authors
