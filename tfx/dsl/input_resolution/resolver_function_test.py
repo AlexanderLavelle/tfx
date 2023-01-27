@@ -267,7 +267,7 @@ class ResolverFunctionTest(tf.test.TestCase):
     with self.subTest('ARTIFACT_LIST with a single output type'):
       result = resolve_artifact_list.with_output_type(X)()
       self.assertIsInstance(result, resolved_channel.ResolvedChannel)
-      self.assertEqual(result._invocation.resolver_function._function.__name__,
+      self.assertEqual(result._invocation.resolver_function.name,
                        'resolve_artifact_list')
       self.assertEqual(result.type, X)
 
@@ -276,7 +276,7 @@ class ResolverFunctionTest(tf.test.TestCase):
       self.assertIsInstance(result, dict)
       self.assertIsInstance(result['x'], resolved_channel.ResolvedChannel)
       self.assertEqual(
-          result['x']._invocation.resolver_function._function.__name__,
+          result['x']._invocation.resolver_function.name,
           'resolve_artifact_multimap')
       self.assertEqual(result['x'].type, X)
 
@@ -317,9 +317,27 @@ class ResolverFunctionTest(tf.test.TestCase):
 
     with for_each.ForEach(resolve()) as each_x:
       self.assertIsInstance(each_x, resolved_channel.ResolvedChannel)
-      self.assertEqual(each_x._invocation.resolver_function._function.__name__,
-                       'resolve')
+      self.assertEqual(each_x._invocation.resolver_function.name, 'resolve')
       self.assertEqual(each_x.type, X)
+
+    @resolver_function.resolver_function(
+        output_type={'x1': X, 'x2': X},
+        unwrap_dict_key=['x1', 'x2']
+    )
+    def resolve2():
+      return DummyNode(
+          output_data_type=resolver_op.DataType.ARTIFACT_MULTIMAP_LIST)
+
+    with for_each.ForEach(resolve2()) as (x1, x2):
+      self.assertIsInstance(x1, resolved_channel.ResolvedChannel)
+      self.assertIsInstance(x2, resolved_channel.ResolvedChannel)
+      self.assertEqual(x1._invocation.resolver_function.name, 'resolve2')
+      self.assertEqual(x2._invocation.resolver_function.name, 'resolve2')
+      self.assertEqual(x1.type, X)
+      self.assertEqual(x2.type, X)
+      self.assertEqual(x1.output_key, 'x1')
+      self.assertEqual(x2.output_key, 'x2')
+
 
 if __name__ == '__main__':
   tf.test.main()

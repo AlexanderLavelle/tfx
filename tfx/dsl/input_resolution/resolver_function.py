@@ -13,7 +13,7 @@
 # limitations under the License.
 """Module for ResolverFunction."""
 
-from typing import Callable, Type, Union, Mapping, Any, Optional, cast
+from typing import Callable, Type, Union, Mapping, Any, Optional, Sequence, cast, overload
 
 from tfx.dsl.control_flow import for_each_internal
 from tfx.dsl.input_resolution import resolver_op
@@ -26,7 +26,8 @@ from tfx.utils import typing_utils
 _ArtifactType = Type[artifact.Artifact]
 _ArtifactTypeMap = Mapping[str, Type[artifact.Artifact]]
 _TypeHint = Union[_ArtifactType, _ArtifactTypeMap]
-_TypeInferrer = Callable[..., Optional[_TypeHint]]
+_TypeInferFn = Callable[..., Optional[_TypeHint]]
+_LoopableTransformFn = Callable[[Mapping[str, channel.BaseChannel]], Any]
 
 
 def _default_type_inferrer(*args: Any, **kwargs: Any) -> Optional[_TypeHint]:
@@ -75,35 +76,49 @@ class ResolverFunction:
   """
 
   def __init__(
-      self, f: Callable[..., resolver_op.Node],
+      self,
+      f: Callable[..., resolver_op.Node],
       *,
+      name: Optional[str] = None,
       output_type: Optional[_TypeHint] = None,
-      output_type_inferrer: _TypeInferrer = _default_type_inferrer,
-      unwrap_dict_key: Optional[str] = None):
+      output_type_inferrer: _TypeInferFn = _default_type_inferrer,
+      loopable_transform: Optional[_LoopableTransformFn] = None,
+  ):
     """Constructor.
 
     Args:
       f: A python function consists of ResolverOp invocations.
+      name: Optional name override for the resolver function. This will override
+        the ResolverFunctionInvocation's function name.
       output_type: Static output type, either a single ArtifactType or a
-          dict[str, ArtifactType]. If output_type is not given,
-          output_type_inferrer will be used to infer the output type.
+        dict[str, ArtifactType]. If output_type is not given,
+        output_type_inferrer will be used to infer the output type.
       output_type_inferrer: An output type inferrer function, which takes the
-          same arguments as the resolver function and returns the output_type.
-          If not given, default inferrer (which mirrors the args[0] type) would
-          be used.
-      unwrap_dict_key: If the resolver function returns ARTIFACT_MULTIMAP_LIST,
-          resolver function can optionally specify unwrap_dict_key so that the
-          returning Loopable is an unwrapped channel instead of a dict of
-          channels. This key must be be the valid string key of the output_type.
+        same arguments as the resolver function and returns the output_type. If
+        not given, default inferrer (which mirrors the args[0] type) would be
+        used.
+      loopable_transform: If the resolver function returns
+        ARTIFACT_MULTIMAP_LIST, resolver function invocation returns a loopable
+        value (the type that can be used with ForEach). This transform function
+        is applied to the `ForEach` with clause target value (often called loop
+        variable) so that the `as` variables are more easy-to-use. For example,
+        one can automatically unwrap the dict key if the dict key is
+        internal-only value and would not be exposed to the user side, using
+        `loopable_transform = lambda d: d[key]`.
     """
     self._function = f
+    self._name = name or f.__name__
     self._output_type = output_type
     if output_type is not None and (
         not typing_utils.is_compatible(output_type, _TypeHint)):
       raise ValueError(
           f'Invalid output_type: {output_type}, should be {_TypeHint}.')
     self._output_type_inferrer = output_type_inferrer
-    self._unwrap_dict_key = unwrap_dict_key
+    self._loopable_transform = loopable_transform
+
+  @property
+  def name(self) -> str:
+    return self._name
 
   def with_output_type(self, output_type: _TypeHint):
     """Statically set output type of the resolver function.
@@ -128,8 +143,12 @@ class ResolverFunction:
       A new resolver function instance with the static output type.
     """
     return ResolverFunction(
-        self._function, output_type=output_type,
-        output_type_inferrer=self._output_type_inferrer)
+        self._function,
+        name=self._name,
+        output_type=output_type,
+        output_type_inferrer=self._output_type_inferrer,
+        loopable_transform=self._loopable_transform,
+    )
 
   @staticmethod
   def _try_convert_to_node(value: Any) -> Any:
@@ -143,7 +162,7 @@ class ResolverFunction:
       })
     return value
 
-  def output_type_inferrer(self, f: _TypeInferrer) -> _TypeInferrer:
+  def output_type_inferrer(self, f: _TypeInferFn) -> _TypeInferFn:
     """Decorator to register resolver function type inferrer.
 
     Usage:
@@ -204,6 +223,10 @@ class ResolverFunction:
         resolver_function=self, args=args, kwargs=kwargs)
 
     if out.output_data_type == resolver_op.DataType.ARTIFACT_LIST:
+      if self._loopable_transform is not None:
+        raise TypeError(
+            'loopable_transform is not applicable for ARTIFACT_LIST output'
+        )
       if not typing_utils.is_compatible(output_type, _ArtifactType):
         raise RuntimeError(
             f'Invalid output_type {output_type}. Expected {_ArtifactType}')
@@ -211,6 +234,10 @@ class ResolverFunction:
       return resolved_channel.ResolvedChannel(
           output_type, out, invocation=invocation)
     if out.output_data_type == resolver_op.DataType.ARTIFACT_MULTIMAP:
+      if self._loopable_transform is not None:
+        raise TypeError(
+            'loopable_transform is not applicable for ARTIFACT_MULTIMAP output'
+        )
       if not typing_utils.is_compatible(output_type, _ArtifactTypeMap):
         raise RuntimeError(
             f'Invalid output_type {output_type}. Expected {_ArtifactTypeMap}')
@@ -223,11 +250,8 @@ class ResolverFunction:
     if out.output_data_type == resolver_op.DataType.ARTIFACT_MULTIMAP_LIST:
       if not typing_utils.is_compatible(output_type, _ArtifactTypeMap):
         raise RuntimeError(
-            f'Invalid output_type {output_type}. Expected {_ArtifactTypeMap}')
-      if self._unwrap_dict_key and self._unwrap_dict_key not in output_type:
-        raise RuntimeError(
-            f'unwrap_dict_key {self._unwrap_dict_key} does not exist in the '
-            f'output type keys: {list(output_type)}.')
+            f'Invalid output_type {output_type}. Expected {_ArtifactTypeMap}'
+        )
 
       def loop_var_factory(for_each_context: for_each_internal.ForEachContext):
         result = {}
@@ -238,8 +262,8 @@ class ResolverFunction:
               key,
               invocation=invocation,
               for_each_context=for_each_context)
-        if self._unwrap_dict_key:
-          result = result[self._unwrap_dict_key]
+        if self._loopable_transform:
+          result = self._loopable_transform(result)
         return result
 
       return for_each_internal.Loopable(loop_var_factory)
@@ -286,15 +310,66 @@ class ResolverFunction:
     return result
 
 
+@overload
 def resolver_function(
-    f: Optional[Callable[..., resolver_op.OpNode]] = None, *,
+    f: Optional[Callable[..., resolver_op.OpNode]] = None,
+) -> ResolverFunction:
+  ...
+
+
+@overload
+def resolver_function(
+    *,
+    name: Optional[str] = None,
     output_type: Optional[_TypeHint] = None,
-    unwrap_dict_key: Optional[str] = None):
-  """Decorator for the resolver function."""
-  if f is None:
-    def decorator(f):
-      return ResolverFunction(
-          f, output_type=output_type, unwrap_dict_key=unwrap_dict_key)
-    return decorator
-  else:
+    unwrap_dict_key: Optional[Union[str, Sequence[str]]] = None,
+) -> Callable[..., ResolverFunction]:
+  ...
+
+
+def resolver_function(
+    f: Optional[Callable[..., resolver_op.OpNode]] = None,
+    *,
+    name: Optional[str] = None,
+    output_type: Optional[_TypeHint] = None,
+    unwrap_dict_key: Optional[Union[str, Sequence[str]]] = None,
+):
+  """Decorator for the resolver function.
+
+  Args:
+    f: Python function to decorate. See the usage at canned_resolver_function.py
+    name: Optional name override if the user-facing function name is not the
+      same as the @resolver_function decorated python function name.
+    output_type: Optional static output type hint.
+    unwrap_dict_key: If present, it will add loopable transform that unwraps
+      dictionary key(s) so that `ForEach` captured value is a single channel,
+      or a tuple of channels. This is only valid if the resolver function return
+      value is ARTIFACT_MULTIMAP_LIST type.
+  Returns:
+    A ResolverFunction, or a decorator to create ResolverFunction.
+  """
+  if f is not None:
     return ResolverFunction(f)
+
+  loopable_transform = None
+  if unwrap_dict_key:
+    if isinstance(unwrap_dict_key, str):
+      key = cast(str, unwrap_dict_key)
+      loopable_transform = lambda d: d[key]
+    elif typing_utils.is_compatible(unwrap_dict_key, Sequence[str]):
+      keys = cast(Sequence[str], unwrap_dict_key)
+      loopable_transform = lambda d: tuple(d[key] for key in keys)
+    else:
+      raise ValueError(
+          'Invalid unwrap_dict_key: Expected str or Sequence[str] but got '
+          f'{unwrap_dict_key}')
+
+  def decorator(f):
+    return ResolverFunction(
+        f,
+        name=name,
+        output_type=output_type,
+        loopable_transform=loopable_transform,
+    )
+
+  return decorator
