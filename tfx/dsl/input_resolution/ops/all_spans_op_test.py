@@ -21,13 +21,8 @@ from tfx.dsl.input_resolution.ops import test_utils
 
 class AllSpansOpTest(tf.test.TestCase):
 
-  def _all_spans(self, *args, **kwargs):
-    return test_utils.strict_run_resolver_op(
-        ops.AllSpans, args=args, kwargs=kwargs
-    )
-
   def testAllSpans_OnEmpty_ReturnsEmpty(self):
-    actual = self._all_spans([])
+    actual = test_utils.run_resolver_op(ops.AllSpans, [])
     self.assertEqual(actual, [])
 
   def testAllSpans_OnNonEmpty_ReturnsAllSortedSpans(self):
@@ -50,15 +45,16 @@ class AllSpansOpTest(tf.test.TestCase):
     for _ in range(4):
       artifacts.append(artifacts.pop(0))
 
-    actual = self._all_spans(artifacts)
+    actual = test_utils.run_resolver_op(ops.AllSpans, artifacts)
     self.assertEqual(actual, [a10, a20, a31, a71, a82])
 
-    actual = self._all_spans(artifacts, keep_all_versions=False)
+    actual = test_utils.run_resolver_op(
+        ops.AllSpans, artifacts, keep_all_versions=False)
     self.assertEqual(actual, [a10, a20, a31, a71, a82])
 
-    actual = self._all_spans(artifacts, keep_all_versions=True)
+    actual = test_utils.run_resolver_op(
+        ops.AllSpans, artifacts, keep_all_versions=True)
     self.assertEqual(actual, [a10, a20, a30, a31, a71, a82])
-
 
 if __name__ == '__main__':
   tf.test.main()

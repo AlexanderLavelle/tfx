@@ -21,13 +21,8 @@ from tfx.dsl.input_resolution.ops import test_utils
 
 class SlidingWindowOpTest(tf.test.TestCase):
 
-  def _sliding_window(self, *args, **kwargs):
-    return test_utils.strict_run_resolver_op(
-        ops.SlidingWindow, args=args, kwargs=kwargs
-    )
-
   def testSlidingWindow_Empty(self):
-    actual = self._sliding_window([])
+    actual = test_utils.run_resolver_op(ops.SlidingWindow, [])
     self.assertEqual(actual, [])
 
   def testSlidingWindow_NonPositiveN(self):
@@ -35,22 +30,23 @@ class SlidingWindowOpTest(tf.test.TestCase):
 
     expected_error = "sliding_window must be > 0"
     with self.assertRaisesRegex(ValueError, expected_error):
-      self._sliding_window([a1], window_size=0)
+      test_utils.run_resolver_op(ops.SlidingWindow, [a1], window_size=0)
 
     with self.assertRaisesRegex(ValueError, expected_error):
-      self._sliding_window([a1], window_size=-1)
+      test_utils.run_resolver_op(ops.SlidingWindow, [a1], window_size=-1)
 
   def testSlidingWindow_SingleEntry(self):
     a1 = test_utils.DummyArtifact()
 
-    actual = self._sliding_window([a1])
+    actual = test_utils.run_resolver_op(ops.SlidingWindow, [a1])
     self.assertEqual(actual, [{"window": [a1]}])
 
-    actual = self._sliding_window([a1], window_size=1, output_key="key")
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, [a1], window_size=1, output_key="key")
     self.assertEqual(actual, [{"key": [a1]}])
 
     # The final window size will be 0, so no artifacts will be returned.
-    actual = self._sliding_window([a1], window_size=2)
+    actual = test_utils.run_resolver_op(ops.SlidingWindow, [a1], window_size=2)
     self.assertEqual(actual, [])
 
   def testSlidingWindow_MultipleEntries(self):
@@ -61,52 +57,71 @@ class SlidingWindowOpTest(tf.test.TestCase):
 
     artifacts = [a1, a2, a3, a4]
 
-    actual = self._sliding_window(artifacts)
-    self.assertEqual(
-        actual,
-        [
-            {"window": [a1]},
-            {"window": [a2]},
-            {"window": [a3]},
-            {"window": [a4]},
-        ],
-    )
+    actual = test_utils.run_resolver_op(ops.SlidingWindow, artifacts)
+    self.assertEqual(actual, [
+        {
+            "window": [a1]
+        },
+        {
+            "window": [a2]
+        },
+        {
+            "window": [a3]
+        },
+        {
+            "window": [a4]
+        },
+    ])
 
-    actual = self._sliding_window(artifacts, window_size=1)
-    self.assertEqual(
-        actual,
-        [
-            {"window": [a1]},
-            {"window": [a2]},
-            {"window": [a3]},
-            {"window": [a4]},
-        ],
-    )
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, artifacts, window_size=1)
+    self.assertEqual(actual, [
+        {
+            "window": [a1]
+        },
+        {
+            "window": [a2]
+        },
+        {
+            "window": [a3]
+        },
+        {
+            "window": [a4]
+        },
+    ])
 
-    actual = self._sliding_window(artifacts, window_size=2)
-    self.assertEqual(
-        actual,
-        [
-            {"window": [a1, a2]},
-            {"window": [a2, a3]},
-            {"window": [a3, a4]},
-        ],
-    )
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, artifacts, window_size=2)
+    self.assertEqual(actual, [
+        {
+            "window": [a1, a2]
+        },
+        {
+            "window": [a2, a3]
+        },
+        {
+            "window": [a3, a4]
+        },
+    ])
 
-    actual = self._sliding_window(artifacts, window_size=3)
-    self.assertEqual(
-        actual,
-        [
-            {"window": [a1, a2, a3]},
-            {"window": [a2, a3, a4]},
-        ],
-    )
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, artifacts, window_size=3)
+    self.assertEqual(actual, [
+        {
+            "window": [a1, a2, a3]
+        },
+        {
+            "window": [a2, a3, a4]
+        },
+    ])
 
-    actual = self._sliding_window(artifacts, window_size=4)
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, artifacts, window_size=4)
     self.assertEqual(actual, [{"window": [a1, a2, a3, a4]}])
 
     # The final window size will be 0, so no artifacts will be returned.
-    actual = self._sliding_window(artifacts, window_size=5)
+    actual = test_utils.run_resolver_op(
+        ops.SlidingWindow, artifacts, window_size=5)
     self.assertEqual(actual, [])
 
 

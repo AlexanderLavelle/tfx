@@ -17,6 +17,7 @@ import random
 
 from absl.testing import parameterized
 import tensorflow as tf
+from tfx.dsl.input_resolution import resolver_op
 from tfx.dsl.input_resolution.ops import group_by_lineage_op
 from tfx.dsl.input_resolution.ops import test_utils
 from tfx.orchestration.portable.input_resolution import exceptions
@@ -64,11 +65,11 @@ class GroupByDisjointLineageTest(
     self.init_mlmd()
 
   def _group_by_disjoint_lineage(self, *args, **kwargs):
-    return test_utils.strict_run_resolver_op(
+    return test_utils.run_resolver_op(
         group_by_lineage_op.GroupByDisjointLineage,
-        args=args,
-        kwargs=kwargs,
-        store=self.store,
+        *args,
+        context=resolver_op.Context(store=self.store),
+        **kwargs,
     )
 
   @parameterized.parameters(
@@ -219,11 +220,11 @@ class GroupByPivotTest(tf.test.TestCase, _LineageUtils):
     self.init_mlmd()
 
   def _group_by_pivot(self, *args, **kwargs):
-    return test_utils.strict_run_resolver_op(
+    return test_utils.run_resolver_op(
         group_by_lineage_op.GroupByPivot,
-        args=args,
-        kwargs=kwargs,
-        store=self.store,
+        *args,
+        context=resolver_op.Context(store=self.store),
+        **kwargs,
     )
 
   def testGroupByPivot(self):
@@ -331,8 +332,8 @@ class GroupByPivotTest(tf.test.TestCase, _LineageUtils):
     self._put_lineage(a, b, c)
     with self.subTest('All connected'):
       result = self._group_by_pivot(
-          {'a': [a], 'b': [b], 'c': [c]}, pivot_key='a'
-      )
+          {'a': [a], 'b': [b], 'c': [c]},
+          pivot_key='a')
       self.assertEqual(result, [{'a': [a], 'b': [b], 'c': []}])
 
   def testGroupByPivot_SelfIsNotNeighbor(self):

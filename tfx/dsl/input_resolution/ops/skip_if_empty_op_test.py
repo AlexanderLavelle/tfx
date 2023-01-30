@@ -22,11 +22,6 @@ from tfx.orchestration.portable.input_resolution import exceptions
 
 class SkipIfEmptyOpTest(tf.test.TestCase):
 
-  def _skip_if_empty(self, *args, **kwargs):
-    return test_utils.strict_run_resolver_op(
-        ops.SkipIfEmpty, args=args, kwargs=kwargs
-    )
-
   def create_artifacts(self, uri_prefix: str, n: int):
     return [
         test_utils.DummyArtifact(uri=uri_prefix + str(i))
@@ -35,13 +30,13 @@ class SkipIfEmptyOpTest(tf.test.TestCase):
 
   def testSkipIfEmpty_OnEmpty_RaisesSkipSignal(self):
     with self.assertRaises(exceptions.SkipSignal):
-      self._skip_if_empty([])
+      test_utils.run_resolver_op(ops.SkipIfEmpty, [])
 
   def testSkipIfEmpty_OnNonEmpty_ReturnsAsIs(self):
     x1, x2, x3 = self.create_artifacts(uri_prefix='x/', n=3)
     input_dicts = [{'x': [x1]}, {'x': [x2]}, {'x': [x3]}]
 
-    result = self._skip_if_empty(input_dicts)
+    result = test_utils.run_resolver_op(ops.SkipIfEmpty, input_dicts)
     self.assertEqual(result, [{'x': [x1]}, {'x': [x2]}, {'x': [x3]}])
 
 
