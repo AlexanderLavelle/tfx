@@ -1651,25 +1651,11 @@ class PredicateTest(parameterized.TestCase, tf.test.TestCase):
     """, placeholder_pb2.PlaceholderExpression())
     self.assertProtoEquals(actual_pb, expected_pb)
 
-  def testPredicateDependentChannels(self):
-    int1 = Channel(type=standard_artifacts.Integer)
-    int2 = Channel(type=standard_artifacts.Integer)
-    pred1 = int1.future().value == 1
-    pred2 = int1.future().value == int2.future().value
-    pred3 = ph.logical_not(pred1)
-    pred4 = ph.logical_and(pred1, pred2)
-
-    self.assertEqual(set(pred1.dependent_channels()), {int1})
-    self.assertEqual(set(pred2.dependent_channels()), {int1, int2})
-    self.assertEqual(set(pred3.dependent_channels()), {int1})
-    self.assertEqual(set(pred4.dependent_channels()), {int1, int2})
-
-  def testPlaceholdersInvolved(self):
+  def testTraverse(self):
     p = ('google/' + ph.runtime_info('platform_config').user + '/' +
          ph.output('model').uri + '/model/' + '0/' +
          ph.exec_property('version'))
-    got = p.placeholders_involved()
-    got_dict = {type(x): x for x in got}
+    got_dict = {type(x): x for x in p.traverse()}
     self.assertCountEqual(
         {
             ph.ArtifactPlaceholder, ph.ExecPropertyPlaceholder,
