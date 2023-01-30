@@ -4,6 +4,9 @@
 
 ## Breaking Changes
 
+*   `placeholder.Placeholder.placeholders_involved()` was replaced with
+    `placeholder.Placeholder.traverse()`.
+
 ### For Pipeline Authors
 
 ### For Component Authors
