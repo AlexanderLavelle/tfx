@@ -28,12 +28,14 @@ class CondContext(dsl_context.DslContext):
   predicate: placeholder.Predicate
 
   def validate(self, containing_nodes: Sequence[base_node.BaseNode]):
-    if any(p.predicate == self.predicate
-           for p in self.ancestors
-           if isinstance(p, CondContext)):
-      raise ValueError(
-          f'Nested conditionals with duplicate predicates: {self.predicate}.'
-          'Consider merging the nested conditionals.')
+    for ancestor_context in self.ancestors:
+      if isinstance(ancestor_context, CondContext):
+        if ancestor_context.predicate.internal_equals(self.predicate):
+          raise ValueError(
+              'Nested conditionals with duplicate predicates:\n'
+              f'{self.predicate!r} vs\n{ancestor_context.predicate!r}.\n'
+              'Please merge the redundant conditionals.'
+          )
 
 
 def get_predicates(
@@ -53,16 +55,18 @@ class Cond(dsl_context_manager.DslContextManager[None]):
 
   Usage:
 
-    evaluator = Evaluator(
-        examples=example_gen.outputs['examples'],
-        model=trainer.outputs['model'],
-        eval_config=EvalConfig(...))
+  ``` python
+  evaluator = Evaluator(
+        examples=example_gen.outputs["examples"],
+        model=trainer.outputs["model"],
+        eval_config=EvalConfig(...),
+  )
 
-    with Cond(evaluator.outputs['blessing'].future()
-              .custom_property('blessed') == 1):
+  with Cond(evaluator.outputs["blessing"].future().custom_property("blessed") == 1):
       pusher = Pusher(
-          model=trainer.outputs['model'],
-          push_destination=PushDestination(...))
+          model=trainer.outputs["model"], push_destination=PushDestination(...)
+      )
+  ```
   """
 
   def __init__(self, predicate: placeholder.Predicate):

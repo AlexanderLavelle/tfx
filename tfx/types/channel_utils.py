@@ -25,12 +25,15 @@ symbols are already available from one of followings:
 Consider other symbols as private.
 """
 
-from typing import Callable, cast, Dict, Iterable, Iterator, List, Type, Optional, Set, Sequence
+import typing
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Type, cast
 
 from tfx.dsl.placeholder import placeholder as ph
 from tfx.proto.orchestration import placeholder_pb2
 from tfx.types import artifact
 from tfx.types import channel
+
+from ml_metadata.proto import metadata_store_pb2
 
 
 class ChannelForTesting(channel.BaseChannel):
@@ -52,6 +55,9 @@ class ChannelForTesting(channel.BaseChannel):
 
   def get_data_dependent_node_ids(self) -> Set[str]:
     return set()
+
+  def future(self) -> channel.ChannelWrappedPlaceholder:
+    return channel.ChannelWrappedPlaceholder(self)
 
 
 def as_channel(artifacts: Iterable[artifact.Artifact]) -> channel.Channel:
@@ -145,26 +151,48 @@ def external_pipeline_artifact_query(
     producer_component_id: str,
     output_key: str,
     pipeline_run_id: str = '',
+    pipeline_run_tags: Sequence[str] = (),
 ) -> channel.ExternalPipelineChannel:
   """Helper function to construct a query to get artifacts from an external pipeline.
 
   Args:
     artifact_type: Subclass of Artifact for this channel.
-    owner: Onwer of the pipeline.
+    owner: Owner of the pipeline.
     pipeline_name: Name of the pipeline the artifacts belong to.
     producer_component_id: Id of the component produces the artifacts.
     output_key: The output key when producer component produces the artifacts in
       this Channel.
     pipeline_run_id: (Optional) Pipeline run id the artifacts belong to.
+    pipeline_run_tags: (Optional) A list of tags the artifacts belong to. It is
+      an AND relationship between tags. For example, if tags=['tag1', 'tag2'],
+      then only artifacts belonging to the run with both 'tag1' and 'tag2' will
+      be returned. Only one of pipeline_run_id and pipeline_run_tags can be set.
 
   Returns:
     channel.ExternalPipelineChannel instance.
 
   Raises:
-    ValueError, if owner or pipeline_name is missing.
+    ValueError, if owner or pipeline_name is missing, or both pipeline_run_id
+      and pipeline_run_tags are set.
   """
   if not owner or not pipeline_name:
     raise ValueError('owner or pipeline_name is missing.')
+
+  if pipeline_run_id and pipeline_run_tags:
+    raise ValueError(
+        'pipeline_run_id and pipeline_run_tags cannot be both set.'
+    )
+
+  run_context_predicates = []
+  for tag in pipeline_run_tags:
+    # TODO(b/264728226): Find a better way to construct the tag name that used
+    # in MLMD. Tag names that used in MLMD are constructed in tflex_mlmd_api.py,
+    # but it is not visible in this file.
+    mlmd_store_tag = '__tag_' + tag + '__'
+    run_context_predicates.append((
+        mlmd_store_tag,
+        metadata_store_pb2.Value(bool_value=True),
+    ))
 
   return channel.ExternalPipelineChannel(
       artifact_type=artifact_type,
@@ -173,16 +201,60 @@ def external_pipeline_artifact_query(
       producer_component_id=producer_component_id,
       output_key=output_key,
       pipeline_run_id=pipeline_run_id,
+      run_context_predicates=run_context_predicates,
   )
 
 
 def get_dependent_channels(
     placeholder: ph.Placeholder,
 ) -> Iterator[channel.Channel]:
-  """Yields all Channels used in/under the given placeholder."""
+  """Yields all Channels used in/ the given placeholder."""
   for p in placeholder.traverse():
     if isinstance(p, ph.ChannelWrappedPlaceholder):
-      yield p.channel
+      yield typing.cast(channel.Channel, p.channel)
+
+
+def unwrap_simple_channel_placeholder(
+    placeholder: ph.Placeholder,
+) -> channel.Channel:
+  """Unwraps a `x.future()[0].value` placeholder and returns its `x`.
+
+  Args:
+    placeholder: A placeholder expression.
+
+  Returns:
+    The (only) channel involved in the expression.
+
+  Raises:
+    ValueError: If the input placeholder is anything more complex than
+      `some_channel.future()[0].value`, and in particular if it involves
+      multiple channels, arithmetic operations or input/output artifacts.
+  """
+  # Validate that it's the right shape.
+  outer_ph = placeholder.encode()
+  index_op = outer_ph.operator.artifact_value_op.expression.operator.index_op
+  cwp = index_op.expression.placeholder
+  if (
+      # This catches the case where we've been navigating down non-existent
+      # proto paths above and been getting default messages all along. If this
+      # sub-message is present, then the whole chain was correct.
+      not index_op.expression.HasField('placeholder')
+      # ChannelWrappedPlaceholder uses INPUT_ARTIFACT for some reason.
+      or cwp.type != placeholder_pb2.Placeholder.Type.INPUT_ARTIFACT
+      # For the `[0]` part of the desired shape.
+      or index_op.index != 0
+  ):
+    raise ValueError(
+        'Expected placeholder of shape somechannel.future()[0].value, but got'
+        f' {placeholder!r}.'
+    )
+
+  # Now that we know there's only one channel inside, we can just extract it:
+  return next(
+      p.channel
+      for p in placeholder.traverse()
+      if isinstance(p, ph.ChannelWrappedPlaceholder)
+  )
 
 
 def encode_placeholder_with_channels(
@@ -220,7 +292,8 @@ def encode_placeholder_with_channels(
   """
   for p in placeholder.traverse():
     if isinstance(p, ph.ChannelWrappedPlaceholder):
-      p.set_key(channel_to_key_fn(p.channel))
+      if not p.key:
+        p.set_key(channel_to_key_fn(p.channel))
   try:
     return placeholder.encode()
   finally:

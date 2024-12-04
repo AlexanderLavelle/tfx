@@ -28,6 +28,7 @@ from tfx.dsl.experimental.conditionals import conditional
 from tfx.dsl.experimental.node_execution_options import utils as execution_options_utils
 from tfx.dsl.input_resolution import resolver_function
 from tfx.dsl.input_resolution import resolver_op
+from tfx.dsl.placeholder import placeholder as ph
 from tfx.orchestration import pipeline
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import channel as channel_types
@@ -36,6 +37,7 @@ from tfx.types import component_spec
 from tfx.types import standard_artifacts
 
 from google.protobuf import text_format
+from ml_metadata.proto import metadata_store_pb2
 
 
 class DummyArtifact(types.Artifact):
@@ -144,7 +146,8 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
         pipeline_name=pipeline_name or self.pipeline_name,
         node_id=node_id,
         output_key=output_key,
-        result=result)
+        result=result,
+    )
     return result
 
   def testCompileAlreadyCompiledInputs(self):
@@ -290,6 +293,256 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
           ctx, node, channel, result)
       self.assertEqual(input_graph_id, second_input_graph_id)
 
+  def testCompilePropertyPredicateForTags(self):
+    with self.subTest('zero tag'):
+      consumer = DummyNode(
+          'MyConsumer',
+          inputs={
+              'input_key': channel_types.ExternalPipelineChannel(
+                  artifact_type=DummyArtifact,
+                  owner='MyProducer',
+                  pipeline_name='pipeline_name',
+                  producer_component_id='producer_component_id',
+                  output_key='z',
+                  run_context_predicates=[],
+              )
+          },
+      )
+      result = self._compile_node_inputs(consumer, components=[consumer])
+      self.assertLen(result.inputs['input_key'].channels, 1)
+      self.assertProtoEquals(
+          """
+        context_queries {
+          type {
+            name: "pipeline"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name"
+            }
+          }
+        }
+        context_queries {
+          type {
+            name: "node"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name.producer_component_id"
+            }
+          }
+        }
+        artifact_query {
+          type {
+            name: "Dummy"
+          }
+        }
+        output_key: "z"
+        metadata_connection_config {
+          [type.googleapis.com/tfx.orchestration.MLMDServiceConfig] {
+            owner: "MyProducer"
+            name: "pipeline_name"
+          }
+        }
+      """,
+          result.inputs['input_key'].channels[0],
+      )
+
+    with self.subTest('one tag'):
+      consumer = DummyNode(
+          'MyConsumer',
+          inputs={
+              'input_key': channel_types.ExternalPipelineChannel(
+                  artifact_type=DummyArtifact,
+                  owner='MyProducer',
+                  pipeline_name='pipeline_name',
+                  producer_component_id='producer_component_id',
+                  output_key='z',
+                  run_context_predicates=[
+                      ('tag_1', metadata_store_pb2.Value(bool_value=True))
+                  ],
+              )
+          },
+      )
+
+      result = self._compile_node_inputs(consumer, components=[consumer])
+
+      self.assertLen(result.inputs['input_key'].channels, 1)
+      self.assertProtoEquals(
+          """
+        context_queries {
+          type {
+            name: "pipeline"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name"
+            }
+          }
+        }
+        context_queries {
+          type {
+            name: "node"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name.producer_component_id"
+            }
+          }
+        }
+        context_queries {
+          type {
+            name: "pipeline_run"
+          }
+          name {
+            field_value {
+              string_value: ""
+            }
+          }
+          property_predicate {
+            value_comparator {
+              property_name: "tag_1"
+              target_value {
+                field_value {
+                  bool_value: true
+                }
+              }
+              op: EQ
+              is_custom_property: true
+            }
+          }
+        }
+        artifact_query {
+          type {
+            name: "Dummy"
+          }
+        }
+        output_key: "z"
+        metadata_connection_config {
+          [type.googleapis.com/tfx.orchestration.MLMDServiceConfig] {
+            owner: "MyProducer"
+            name: "pipeline_name"
+          }
+        }
+      """,
+          result.inputs['input_key'].channels[0],
+      )
+
+    with self.subTest('three tags'):
+      consumer = DummyNode(
+          'MyConsumer',
+          inputs={
+              'input_key': channel_types.ExternalPipelineChannel(
+                  artifact_type=DummyArtifact,
+                  owner='MyProducer',
+                  pipeline_name='pipeline_name',
+                  producer_component_id='producer_component_id',
+                  output_key='z',
+                  run_context_predicates=[
+                      ('tag_1', metadata_store_pb2.Value(bool_value=True)),
+                      ('tag_2', metadata_store_pb2.Value(bool_value=True)),
+                      ('tag_3', metadata_store_pb2.Value(bool_value=True)),
+                  ],
+              )
+          },
+      )
+
+      result = self._compile_node_inputs(consumer, components=[consumer])
+      self.assertLen(result.inputs['input_key'].channels, 1)
+      self.assertProtoEquals(
+          """
+          context_queries {
+          type {
+            name: "pipeline"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name"
+            }
+          }
+        }
+        context_queries {
+          type {
+            name: "node"
+          }
+          name {
+            field_value {
+              string_value: "pipeline_name.producer_component_id"
+            }
+          }
+        }
+        context_queries {
+          type {
+            name: "pipeline_run"
+          }
+          name {
+            field_value {
+              string_value: ""
+            }
+          }
+          property_predicate {
+            binary_logical_operator {
+              op: AND
+              lhs {
+                binary_logical_operator {
+                  op: AND
+                  lhs {
+                    value_comparator {
+                      property_name: "tag_1"
+                      target_value {
+                        field_value {
+                          bool_value: true
+                        }
+                      }
+                      op: EQ
+                      is_custom_property: true
+                    }
+                  }
+                  rhs {
+                    value_comparator {
+                      property_name: "tag_2"
+                      target_value {
+                        field_value {
+                          bool_value: true
+                        }
+                      }
+                      op: EQ
+                      is_custom_property: true
+                    }
+                  }
+                }
+              }
+              rhs {
+                value_comparator {
+                  property_name: "tag_3"
+                  target_value {
+                    field_value {
+                      bool_value: true
+                    }
+                  }
+                  op: EQ
+                  is_custom_property: true
+                }
+              }
+            }
+          }
+        }
+        artifact_query {
+          type {
+            name: "Dummy"
+          }
+        }
+        output_key: "z"
+        metadata_connection_config {
+          [type.googleapis.com/tfx.orchestration.MLMDServiceConfig] {
+            owner: "MyProducer"
+            name: "pipeline_name"
+          }
+        }
+      """,
+          result.inputs['input_key'].channels[0],
+      )
+
   def testCompileInputGraphRef(self):
     with dummy_artifact_list.given_output_type(DummyArtifact):
       x1 = dummy_artifact_list()
@@ -324,7 +577,8 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
     self.assertEqual(result.inputs[cond_input_key].min_count, 1)
     self.assertLen(result.conditionals, 1)
     cond = list(result.conditionals.values())[0]
-    self.assertProtoEquals("""
+    self.assertProtoEquals(
+        """
       operator {
         compare_op {
           op: EQUAL
@@ -341,7 +595,7 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
                     index_op {
                       expression {
                         placeholder {
-                          key: "%s"
+                          key: "_CondNode.x"
                         }
                       }
                     }
@@ -352,7 +606,9 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
           }
         }
       }
-    """ % cond_input_key, cond.placeholder_expression)
+    """,
+        cond.placeholder_expression,
+    )
 
   def testCompileInputsForDynamicProperties(self):
     producer = DummyNode('Producer')
@@ -368,8 +624,67 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
     self.assertFalse(result.inputs[dynamic_prop_input_key].hidden)
     self.assertEqual(result.inputs[dynamic_prop_input_key].min_count, 1)
 
-  def testCompileMinCount(self):
+  def testCompileInputsForComplexDynamicProperties(self):
+    producer = DummyNode('Producer')
+    consumer = DummyNode(
+        'Consumer',
+        exec_properties={
+            'x': (
+                producer.output('x', standard_artifacts.Integer).future().value
+                + 'foo'
+                + ph.execution_invocation().pipeline_run_id
+            )
+        },
+    )
 
+    result = self._compile_node_inputs(
+        consumer, components=[producer, consumer]
+    )
+
+    self.assertLen(result.inputs, 1)
+    dynamic_prop_input_key = list(result.inputs)[0]
+    self.assertFalse(result.inputs[dynamic_prop_input_key].hidden)
+    self.assertEqual(result.inputs[dynamic_prop_input_key].min_count, 1)
+
+  def testCompileInputsForDynamicPropertyWithUri(self):
+    producer = DummyNode('Producer')
+    consumer = DummyNode(
+        'Consumer',
+        exec_properties={
+            'x': producer.output('x', standard_artifacts.Integer).future().uri
+        },
+    )
+
+    result = self._compile_node_inputs(
+        consumer, components=[producer, consumer]
+    )
+
+    self.assertLen(result.inputs, 1)
+    dynamic_prop_input_key = list(result.inputs)[0]
+    self.assertFalse(result.inputs[dynamic_prop_input_key].hidden)
+    self.assertEqual(result.inputs[dynamic_prop_input_key].min_count, 1)
+
+  def testCompileInputsForInvalidDynamicProperty(self):
+    producer = DummyNode('Producer')
+    consumer = DummyNode(
+        'Consumer',
+        exec_properties={
+            'x': (
+                producer.output('x', standard_artifacts.Examples).future().value
+            )
+        },
+    )
+
+    with self.assertRaisesRegex(
+        ValueError, '.*must be of a value artifact type.*Examples.*x.*Consumer'
+    ):
+      self._compile_node_inputs(consumer, components=[producer, consumer])
+
+  @parameterized.parameters(
+      (pipeline_pb2.NodeExecutionOptions.ALL_UPSTREAM_NODES_COMPLETED,),
+      (pipeline_pb2.NodeExecutionOptions.LAZILY_ALL_UPSTREAM_NODES_COMPLETED),
+  )
+  def testCompileMinCount(self, trigger_strategy):
     class DummyComponentSpec(component_spec.ComponentSpec):
       INPUTS = {
           'required': component_spec.ChannelParameter(
@@ -407,8 +722,8 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
     c5 = DummyComponent(
         required=producer.output('x')).with_id('Consumer5')
     c5.node_execution_options = execution_options_utils.NodeExecutionOptions(
-        trigger_strategy=pipeline_pb2.NodeExecutionOptions
-        .ALL_UPSTREAM_NODES_COMPLETED)
+        trigger_strategy=trigger_strategy
+    )
 
     p = self._prepare_pipeline(
         [producer, optional_producer, c1, c2, c3, c4, c5])
@@ -476,6 +791,56 @@ class NodeInputsCompilerTest(tf.test.TestCase, parameterized.TestCase):
       self.assertNotIn('y', result.inputs)
     self.assertEqual(result.inputs['_Producer.z'].hidden, not dynamic_z)
 
+  def test_min_count_with_allow_empty_from(self):
+    class DummyComponentSpec(component_spec.ComponentSpec):
+      INPUTS = {
+          'required': component_spec.ChannelParameter(
+              DummyArtifact, optional=False
+          ),
+          'optional_but_not_allow_empty': component_spec.ChannelParameter(
+              DummyArtifact, optional=True, allow_empty=False
+          ),
+          'optional_and_allow_empty': component_spec.ChannelParameter(
+              DummyArtifact, optional=True, allow_empty=True
+          ),
+      }
+      OUTPUTS = {}
+      PARAMETERS = {}
 
-if __name__ == '__main__':
-  tf.test.main()
+    class DummyComponent(base_component.BaseComponent):
+      SPEC_CLASS = DummyComponentSpec
+      EXECUTOR_SPEC = executor_spec.ExecutorSpec()
+
+      def __init__(self, **inputs):
+        super().__init__(DummyComponentSpec(**inputs))
+
+    producer = DummyNode('Producer')
+
+    output_channel = producer.output('x').as_optional()
+
+    c1 = DummyComponent(required=output_channel).with_id('Consumer1')
+    c2 = DummyComponent(
+        required=output_channel,
+        optional_but_not_allow_empty=output_channel,
+    ).with_id('Consumer2')
+    c3 = DummyComponent(
+        required=output_channel, optional_and_allow_empty=output_channel
+    ).with_id('Consumer3')
+
+    p = self._prepare_pipeline([producer, c1, c2, c3])
+    ctx = compiler_context.PipelineContext(p)
+    # Add dummy already compiled output channels to compiler context.
+    ctx.channels[producer.output('x')] = pipeline_pb2.InputSpec.Channel()
+
+    r1 = pipeline_pb2.NodeInputs()
+    node_inputs_compiler.compile_node_inputs(ctx, c1, r1)
+    r3 = pipeline_pb2.NodeInputs()
+    node_inputs_compiler.compile_node_inputs(ctx, c3, r3)
+
+    self.assertEqual(r1.inputs['required'].min_count, 0)
+    self.assertEqual(r3.inputs['required'].min_count, 0)
+    self.assertEqual(r3.inputs['optional_and_allow_empty'].min_count, 0)
+
+    with self.assertRaises(ValueError):
+      r2 = pipeline_pb2.NodeInputs()
+      node_inputs_compiler.compile_node_inputs(ctx, c2, r2)

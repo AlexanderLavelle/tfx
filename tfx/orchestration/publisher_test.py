@@ -46,7 +46,7 @@ class PublisherTest(tf.test.TestCase):
         pipeline_info=self._pipeline_info)
 
   def testPrepareExecutionComplete(self):
-    p = publisher.Publisher(metadata_handler=self._mock_metadata)
+    p = publisher.Publisher(metadata_handle=self._mock_metadata)
     p.publish_execution(
         component_info=self._component_info,
         output_artifacts=self._output_dict,
@@ -58,7 +58,3 @@ class PublisherTest(tf.test.TestCase):
     self.assertEqual(
         self._output_dict['output_data'][0].get_string_custom_property(
             'tfx_version'), version.__version__)
-
-
-if __name__ == '__main__':
-  tf.test.main()

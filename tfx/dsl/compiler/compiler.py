@@ -19,6 +19,8 @@ from tfx import types
 from tfx.dsl.compiler import compiler_context
 from tfx.dsl.compiler import compiler_utils
 from tfx.dsl.compiler import constants
+from tfx.dsl.compiler import node_contexts_compiler
+from tfx.dsl.compiler import node_execution_options_utils
 from tfx.dsl.compiler import node_inputs_compiler
 from tfx.dsl.components.base import base_component
 from tfx.dsl.components.base import base_driver
@@ -55,7 +57,12 @@ class Compiler:
 
     # Step 2: Node Context
     # Inner pipeline's contexts.
-    _set_node_context(node, pipeline_ctx)
+    node.contexts.CopyFrom(
+        node_contexts_compiler.compile_node_contexts(
+            pipeline_ctx,
+            node.node_info.id,
+        )
+    )
 
     # Step 3: Node inputs
     # Pipeline node inputs are stored as the inputs of the PipelineBegin node.
@@ -86,6 +93,16 @@ class Compiler:
       # Sort node ids so that compiler generates consistent results.
       node.upstream_nodes.extend(sorted(upstreams))
 
+    # Set node execution options based on pipeline-level NodeExecutionOptions.
+    # Because _compile_pipeline_begin_node may be called if either the pipeline
+    # is a subpipeline OR the pipeline has inputs we can *only* pass in the
+    # parent context if this begin node is for a subpipeline.
+    if pipeline_ctx.is_subpipeline:
+      execution_options_ctx = pipeline_ctx.parent
+    else:
+      execution_options_ctx = pipeline_ctx
+    _set_node_execution_options(node, p, execution_options_ctx, p.enable_cache)
+
     # PipelineBegin node's downstream nodes are the nodes in the inner pipeline
     # that consumes pipeline's input channels.
     result = set()
@@ -110,7 +127,12 @@ class Compiler:
 
     # Step 2: Node Context
     # Inner pipeline's contexts.
-    _set_node_context(node, pipeline_ctx)
+    node.contexts.CopyFrom(
+        node_contexts_compiler.compile_node_contexts(
+            pipeline_ctx,
+            node.node_info.id,
+        )
+    )
 
     # Step 3: Node inputs
     node_inputs_compiler.compile_node_inputs(
@@ -183,12 +205,17 @@ class Compiler:
     node.node_info.id = tfx_node.id
 
     # Step 2: Node Context
-    _set_node_context(node, pipeline_ctx)
+    node.contexts.CopyFrom(
+        node_contexts_compiler.compile_node_contexts(
+            pipeline_ctx,
+            node.node_info.id,
+        )
+    )
 
     # Step 3: Node inputs
     node_inputs_compiler.compile_node_inputs(
-        pipeline_ctx, tfx_node, node.inputs)
-
+        pipeline_ctx, tfx_node, node.inputs
+    )
     # Step 4: Node outputs
     if (isinstance(tfx_node, base_component.BaseComponent) or
         compiler_utils.is_importer(tfx_node)):
@@ -230,32 +257,8 @@ class Compiler:
     # Sort node ids so that compiler generates consistent results.
     node.downstream_nodes.extend(sorted(downstreams))
 
-    # Step 8: Node execution options
-    node.execution_options.caching_options.enable_cache = enable_cache
-    node_execution_options = tfx_node.node_execution_options
-    if node_execution_options:
-      assert isinstance(node_execution_options,
-                        execution_options_utils.NodeExecutionOptions)
-      if (node_execution_options.trigger_strategy or
-          node_execution_options.success_optional
-         ) and not pipeline_ctx.is_sync_mode:
-        raise ValueError("Node level triggering strategies and success "
-                         "optionality are only used in SYNC pipelines.")
-      node.execution_options.strategy = node_execution_options.trigger_strategy
-      node.execution_options.node_success_optional = node_execution_options.success_optional
-      node.execution_options.max_execution_retries = node_execution_options.max_execution_retries
-      node.execution_options.execution_timeout_sec = node_execution_options.execution_timeout_sec
-
-    if pipeline_ctx.is_async_mode:
-      input_triggers = node.execution_options.async_trigger.input_triggers
-      for input_key, input_channel in tfx_node.inputs.items():
-        if isinstance(input_channel.input_trigger, channel_types.NoTrigger):
-          input_triggers[input_key].no_trigger = True
-        if isinstance(input_channel.input_trigger,
-                      channel_types.TriggerByProperty):
-          input_triggers[input_key].trigger_by_property.property_keys.extend(
-              input_channel.input_trigger.property_keys
-          )
+    # Step 8: Node execution options and triggers.
+    _set_node_execution_options(node, tfx_node, pipeline_ctx, enable_cache)
 
     # Step 9: Per-node platform config
     if isinstance(tfx_node, base_component.BaseComponent):
@@ -347,6 +350,17 @@ class Compiler:
         pipeline_node_pb = self.compile(node, pipeline_ctx)
         pipeline_or_node = pipeline_pb.PipelineOrNode()
         pipeline_or_node.sub_pipeline.CopyFrom(pipeline_node_pb)
+
+        # Set parent_ids of sub-pipelines, in the order of outer -> inner parent
+        # pipelines.
+        pipeline_or_node.sub_pipeline.pipeline_info.parent_ids.extend(
+            parent_pipeline.pipeline_info.pipeline_name
+            for parent_pipeline in pipeline_ctx.parent_pipelines
+        )
+        pipeline_or_node.sub_pipeline.pipeline_info.parent_ids.append(
+            pipeline_ctx.pipeline_info.pipeline_name
+        )
+
         pipeline_pb.nodes.append(pipeline_or_node)
       else:
         node_pb = self._compile_node(node, pipeline_ctx, deployment_config,
@@ -379,80 +393,24 @@ def _fully_qualified_name(cls: Type[Any]):
 def _validate_pipeline(tfx_pipeline: pipeline.Pipeline,
                        parent_pipelines: List[pipeline.Pipeline]):
   """Performs pre-compile validations."""
-  if (tfx_pipeline.execution_mode == pipeline.ExecutionMode.ASYNC and
-      compiler_utils.has_task_dependency(tfx_pipeline)):
-    raise ValueError("Task dependency is not supported in ASYNC mode.")
+  if tfx_pipeline.execution_mode == pipeline.ExecutionMode.ASYNC:
+    if compiler_utils.has_task_dependency(tfx_pipeline):
+      raise ValueError("Task dependency is not supported in ASYNC mode.")
+
+    if compiler_utils.has_resolver_node(tfx_pipeline):
+      raise ValueError(
+          "Resolver nodes can not be used in ASYNC mode. Use resolver "
+          "functions instead."
+      )
 
   if not compiler_utils.ensure_topological_order(tfx_pipeline.components):
     raise ValueError("Pipeline components are not topologically sorted.")
 
-  if parent_pipelines and tfx_pipeline.execution_mode != pipeline.ExecutionMode.SYNC:
+  if (
+      parent_pipelines
+      and tfx_pipeline.execution_mode != pipeline.ExecutionMode.SYNC
+  ):
     raise ValueError("Subpipeline has to be Sync execution mode.")
-
-
-def _set_node_context(node: pipeline_pb2.PipelineNode,
-                      pipeline_ctx: compiler_context.PipelineContext):
-  """Compiles the node contexts of a pipeline node."""
-  # Context for the pipeline, across pipeline runs.
-  pipeline_context_pb = node.contexts.contexts.add()
-  pipeline_context_pb.type.name = constants.PIPELINE_CONTEXT_TYPE_NAME
-  pipeline_context_pb.name.field_value.string_value = (
-      pipeline_ctx.pipeline_info.pipeline_context_name)
-
-  # Context for the current pipeline run.
-  if pipeline_ctx.is_sync_mode:
-    pipeline_run_context_pb = node.contexts.contexts.add()
-    pipeline_run_context_pb.type.name = constants.PIPELINE_RUN_CONTEXT_TYPE_NAME
-    # TODO(kennethyang): Miragte pipeline run id to structural_runtime_parameter
-    # To keep existing IR textprotos used in tests unchanged, we only use
-    # structural_runtime_parameter for subpipelines. After the subpipeline being
-    # implemented, we will need to migrate normal pipelines to
-    # structural_runtime_parameter as well for consistency. Similar for below.
-    if pipeline_ctx.is_subpipeline:
-      compiler_utils.set_structural_runtime_parameter_pb(
-          pipeline_run_context_pb.name.structural_runtime_parameter, [
-              f"{pipeline_ctx.pipeline_info.pipeline_context_name}_",
-              (constants.PIPELINE_RUN_ID_PARAMETER_NAME, str)
-          ])
-    else:
-      compiler_utils.set_runtime_parameter_pb(
-          pipeline_run_context_pb.name.runtime_parameter,
-          constants.PIPELINE_RUN_ID_PARAMETER_NAME, str)
-
-  # Contexts inherited from the parent pipelines.
-  for i, parent_pipeline in enumerate(pipeline_ctx.parent_pipelines[::-1]):
-    parent_pipeline_context_pb = node.contexts.contexts.add()
-    parent_pipeline_context_pb.type.name = constants.PIPELINE_CONTEXT_TYPE_NAME
-    parent_pipeline_context_pb.name.field_value.string_value = (
-        parent_pipeline.pipeline_info.pipeline_context_name)
-
-    if parent_pipeline.execution_mode == pipeline.ExecutionMode.SYNC:
-      pipeline_run_context_pb = node.contexts.contexts.add()
-      pipeline_run_context_pb.type.name = (
-          constants.PIPELINE_RUN_CONTEXT_TYPE_NAME)
-
-      # TODO(kennethyang): Miragte pipeline run id to structural runtime
-      # parameter for the similar reason mentioned above.
-      # Use structural runtime parameter to represent pipeline_run_id except
-      # for the root level pipeline, for backward compatibility.
-      if i == len(pipeline_ctx.parent_pipelines) - 1:
-        compiler_utils.set_runtime_parameter_pb(
-            pipeline_run_context_pb.name.runtime_parameter,
-            constants.PIPELINE_RUN_ID_PARAMETER_NAME, str)
-      else:
-        compiler_utils.set_structural_runtime_parameter_pb(
-            pipeline_run_context_pb.name.structural_runtime_parameter, [
-                f"{parent_pipeline.pipeline_info.pipeline_context_name}_",
-                (constants.PIPELINE_RUN_ID_PARAMETER_NAME, str)
-            ])
-
-  # Context for the node, across pipeline runs.
-  node_context_pb = node.contexts.contexts.add()
-  node_context_pb.type.name = constants.NODE_CONTEXT_TYPE_NAME
-  node_context_pb.name.field_value.string_value = (
-      compiler_utils.node_context_name(
-          pipeline_ctx.pipeline_info.pipeline_context_name,
-          node.node_info.id))
 
 
 def _set_node_outputs(node: pipeline_pb2.PipelineNode,
@@ -513,13 +471,8 @@ def _set_node_parameters(node: pipeline_pb2.PipelineNode,
       compiler_utils.set_runtime_parameter_pb(parameter_value.runtime_parameter,
                                               value.name, value.ptype,
                                               value.default)
-    # RuntimeInfoPlaceholder passes Execution parameters of Facade
-    # components.
-    elif isinstance(value, placeholder.RuntimeInfoPlaceholder):
-      parameter_value.placeholder.CopyFrom(value.encode())
-    # ChannelWrappedPlaceholder passes dynamic execution parameter.
-    elif isinstance(value, placeholder.ChannelWrappedPlaceholder):
-      compiler_utils.validate_dynamic_exec_ph_operator(value)
+    elif isinstance(value, placeholder.Placeholder):
+      compiler_utils.validate_exec_property_placeholder(key, value)
       parameter_value.placeholder.CopyFrom(
           channel_utils.encode_placeholder_with_channels(
               value, compiler_utils.implicit_channel_key
@@ -532,6 +485,64 @@ def _set_node_parameters(node: pipeline_pb2.PipelineNode,
         raise ValueError(
             "Component {} got unsupported parameter {} with type {}.".format(
                 tfx_node.id, key, type(value))) from e
+
+
+def _set_node_execution_options(
+    node: pipeline_pb2.PipelineNode,
+    tfx_node: base_node.BaseNode,
+    pipeline_ctx: compiler_context.PipelineContext,
+    enable_cache: bool,
+):
+  """Compiles and sets NodeExecutionOptions of a pipeline node."""
+  options_py = tfx_node.node_execution_options
+  if options_py:
+    assert isinstance(options_py, execution_options_utils.NodeExecutionOptions)
+    if (
+        options_py.trigger_strategy
+        not in (
+            pipeline_pb2.NodeExecutionOptions.TriggerStrategy.TRIGGER_STRATEGY_UNSPECIFIED,
+            pipeline_pb2.NodeExecutionOptions.TriggerStrategy.ALL_UPSTREAM_NODES_SUCCEEDED,
+        )
+        or options_py.success_optional
+        or options_py.lifetime_start
+    ) and pipeline_ctx.is_async_mode:
+      raise ValueError(
+          "Node level triggering strategies, success optionality, and resource"
+          " lifetimes are not allowed in ASYNC pipelines."
+      )
+    if (
+        options_py.trigger_strategy
+        == pipeline_pb2.NodeExecutionOptions.LIFETIME_END_WHEN_SUBGRAPH_CANNOT_PROGRESS
+        and not options_py.lifetime_start
+    ):
+      raise ValueError(
+          f"Node {node.node_info.id} has the trigger strategy"
+          " LIFETIME_END_WHEN_SUBGRAPH_CANNOT_PROGRESS set but no"
+          " lifetime_start. In order to use the trigger strategy the node"
+          " must have a lifetime_start."
+      )
+    options_proto = node_execution_options_utils.compile_node_execution_options(
+        options_py
+    )
+  else:
+    options_proto = pipeline_pb2.NodeExecutionOptions()
+
+  options_proto.caching_options.enable_cache = enable_cache
+  node.execution_options.CopyFrom(options_proto)
+
+  # TODO: b/310726801 - We should throw an error if this is an invalid
+  # configuration.
+  if pipeline_ctx.is_async_mode:
+    input_triggers = node.execution_options.async_trigger.input_triggers
+    for input_key, input_channel in tfx_node.inputs.items():
+      if isinstance(input_channel.input_trigger, channel_types.NoTrigger):
+        input_triggers[input_key].no_trigger = True
+      if isinstance(
+          input_channel.input_trigger, channel_types.TriggerByProperty
+      ):
+        input_triggers[input_key].trigger_by_property.property_keys.extend(
+            input_channel.input_trigger.property_keys
+        )
 
 
 def _find_runtime_upstream_node_ids(

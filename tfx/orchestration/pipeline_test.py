@@ -17,19 +17,24 @@ import itertools
 import os
 from typing import Any, Dict, Optional, Type
 
-import tensorflow as tf
 from tfx import types
 from tfx.dsl.components.base import base_beam_component
 from tfx.dsl.components.base import base_component
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.components.base import base_node
 from tfx.dsl.components.base import executor_spec
+from tfx.dsl.context_managers import dsl_context_registry
+from tfx.dsl.context_managers import test_utils
 from tfx.dsl.placeholder import placeholder as ph
 from tfx.orchestration import metadata
 from tfx.orchestration import pipeline
 from tfx.types.component_spec import ChannelParameter
 from tfx.types.component_spec import ExecutionParameter
 from tfx.utils import test_case_utils
+
+
+Node = test_utils.Node
+TestContext = test_utils.TestContext
 
 
 class _OutputArtifact(types.Artifact):
@@ -142,6 +147,7 @@ class _OutputTypeE(types.Artifact):
 
 
 class PipelineTest(test_case_utils.TfxTest):
+  assert_registry_equal = test_utils.assert_registry_equal
 
   def setUp(self):
     super().setUp()
@@ -151,7 +157,7 @@ class PipelineTest(test_case_utils.TfxTest):
   def testPipelineWithDynamicExecProperties(self):
     component_a = _make_fake_component_instance('component_a', _OutputTypeA, {},
                                                 {})
-    dynamic_exec_prop = component_a.outputs['output'].future()[0].value
+    dynamic_exec_prop = component_a.outputs['output'].future()[0].value + 'foo'
     component_b = _make_fake_component_instance(
         name='component_b',
         output_type=_OutputTypeB,
@@ -167,8 +173,7 @@ class PipelineTest(test_case_utils.TfxTest):
         enable_cache=True,
         metadata_connection_config=self._metadata_connection_config,
         beam_pipeline_args=['--runner=PortableRunner'],
-        additional_pipeline_args={})
-
+    )
     self.assertCountEqual(my_pipeline.components[0].downstream_nodes,
                           [component_b])
     self.assertCountEqual(my_pipeline.components[1].upstream_nodes,
@@ -198,13 +203,17 @@ class PipelineTest(test_case_utils.TfxTest):
         pipeline_name='a',
         pipeline_root='b',
         components=[
-            component_d, component_c, component_a, component_b, component_e,
-            component_a
+            component_d,
+            component_c,
+            component_a,
+            component_b,
+            component_e,
+            component_a,
         ],
         enable_cache=True,
         metadata_connection_config=self._metadata_connection_config,
         beam_pipeline_args=['--runner=PortableRunner'],
-        additional_pipeline_args={})
+    )
     self.assertCountEqual(
         my_pipeline.components,
         [component_a, component_b, component_c, component_d, component_e])
@@ -369,7 +378,6 @@ class PipelineTest(test_case_utils.TfxTest):
     p = pipeline.Pipeline(
         pipeline_name='a',
         pipeline_root='b',
-        log_root='c',
         components=[
             _make_fake_component_instance(
                 'component_a', _OutputTypeA, {}, {},
@@ -388,7 +396,6 @@ class PipelineTest(test_case_utils.TfxTest):
     p = pipeline.Pipeline(
         pipeline_name='a',
         pipeline_root='b',
-        log_root='c',
         beam_pipeline_args=[expected_args[0]],
         metadata_connection_config=self._metadata_connection_config)
     p.components = [
@@ -399,6 +406,48 @@ class PipelineTest(test_case_utils.TfxTest):
     self.assertEqual(expected_args,
                      p.components[0].executor_spec.beam_pipeline_args)
 
+  def testNestedPipelineRegistry(self):
+    with dsl_context_registry.new_registry() as reg:
+      with TestContext('Ctx1'):
+        a = Node('A')
+        b = Node('B')
+        with TestContext('Ctx2'):
+          c = Node('C')
+          with TestContext('Ctx3'):
+            d = Node('D')
+          p1 = pipeline.Pipeline(pipeline_name='p1', components=[c, d])
+        p2 = pipeline.Pipeline(pipeline_name='p2', components=[b, p1])
+      p3 = pipeline.Pipeline(pipeline_name='p3', components=[a, p2])
 
-if __name__ == '__main__':
-  tf.test.main()
+    p1.finalize()
+    p2.finalize()
+    p3.finalize()
+
+    self.assert_registry_equal(
+        p1.dsl_context_registry,
+        """
+        C
+        Ctx3 {
+          D
+        }
+        """,
+    )
+    self.assert_registry_equal(
+        p2.dsl_context_registry,
+        """
+        B
+        Ctx2 {
+          p1
+        }
+        """,
+    )
+    self.assert_registry_equal(
+        p3.dsl_context_registry,
+        """
+        Ctx1 {
+          A
+          p2
+        }
+        """,
+    )
+    self.assert_registry_equal(reg, 'p3')

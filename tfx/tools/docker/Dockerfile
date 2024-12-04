@@ -17,7 +17,7 @@ ARG BASE_IMAGE
 # Apache beam version to get Beam binaries.
 ARG BEAM_VERSION
 
-FROM gcr.io/tfx-oss-public/tfx_base:py38-20230426 as wheel-builder
+FROM gcr.io/tfx-oss-public/tfx_base:py310-20230921 as wheel-builder
 # docker build command should be run under root directory of github checkout.
 ENV TFX_DIR=/tfx
 ADD . ${TFX_DIR}/src
@@ -27,17 +27,21 @@ WORKDIR ${TFX_DIR}
 ARG TFX_DEPENDENCY_SELECTOR
 ENV TFX_DEPENDENCY_SELECTOR=${TFX_DEPENDENCY_SELECTOR}
 
-RUN python -m pip install --upgrade pip
+RUN python -m pip install --upgrade pip wheel setuptools
+RUN python -m pip install tomli
 
 # TODO(b/175089240): clean up conditional checks on whether ml-pipelines-sdk is
 # built after TFX versions <= 0.25 are no longer eligible for cherry-picks.
 RUN cd ${TFX_DIR}/src; \
     if [ -e "package_build" ]; then \
       bash -x package_build/initialize.sh; \
+      cd package_build/ml-pipelines-sdk; \
       CFLAGS=$(/usr/bin/python-config --cflags) \
-        python package_build/ml-pipelines-sdk/setup.py bdist_wheel; \
+        python setup.py bdist_wheel; \
+      cd ../../package_build/tfx; \
       CFLAGS=$(/usr/bin/python-config --cflags) \
-        python package_build/tfx/setup.py bdist_wheel; \
+        python setup.py bdist_wheel; \
+      cd ../..; \
       MLSDK_WHEEL=$(find dist -name "ml_pipelines_sdk-*.whl"); \
       TFX_WHEEL=$(find dist -name "tfx-*.whl"); \
     else \
@@ -50,14 +54,14 @@ RUN cd ${TFX_DIR}/src; \
       CFLAGS=$(/usr/bin/python-config --cflags) \
         python -m pip install \
           --extra-index-url https://pypi-nightly.tensorflow.org/simple \
-          ${MLSDK_WHEEL} ${TFX_WHEEL}[docker-image] ; \
+          ${MLSDK_WHEEL} ${TFX_WHEEL}[docker-image] -c tfx/tools/docker/requirements.txt; \
     else \
       CFLAGS=$(/usr/bin/python-config --cflags) \
-        python -m pip install ${MLSDK_WHEEL} ${TFX_WHEEL}[docker-image] ; \
+        python -m pip install ${MLSDK_WHEEL} ${TFX_WHEEL}[docker-image] -c tfx/tools/docker/requirements.txt; \
     fi;
 
 # We need to name this step for the next COPY --from command.
-FROM apache/beam_python3.7_sdk:${BEAM_VERSION} as beam-worker
+FROM apache/beam_python3.10_sdk:${BEAM_VERSION} as beam-worker
 
 # Build stage to extend DLVM image.
 FROM ${BASE_IMAGE} as install
@@ -69,19 +73,6 @@ ARG ADDITIONAL_PACKAGES
 ARG TFX_DEPENDENCY_SELECTOR
 ENV TFX_DEPENDENCY_SELECTOR=${TFX_DEPENDENCY_SELECTOR}
 
-# TODO(b/264498526): Remove after DLVM upgrades its python version.
-ENV PATH="/usr/bin:${PATH}"
-RUN ln -s /usr/bin/python3.8 /usr/bin/python
-
-ARG APT_COMMAND="apt-get -o Acquire::Retries=3 -y"
-
-RUN ${APT_COMMAND} update && ${APT_COMMAND} upgrade
-
-RUN ${APT_COMMAND} update && \
-  ${APT_COMMAND} install \
-  build-essential \
-  python3.8-dev
-
 # Copy from image matching installed version of 'apache-beam'.
 COPY --from=beam-worker /opt/apache/beam /opt/apache/beam
 # Dataflow SDK worker image looks for pip at a different location by default
@@ -92,6 +83,8 @@ ENV pip=/opt/conda/bin/pip
 ENTRYPOINT ["/opt/apache/beam/boot"]
 
 LABEL maintainer="tensorflow-extended-dev@googlegroups.com"
+
+RUN sed -i 's/python3/python/g' /usr/bin/pip
 
 RUN python -m pip install --upgrade pip
 

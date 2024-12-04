@@ -21,7 +21,6 @@ from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
 import tensorflow_model_analysis as tfma
 from tfx import v1 as tfx
 from tfx.components.example_gen import utils
-from tfx.components.trainer.executor import Executor
 from tfx.dsl.component.experimental import executor_specs
 from tfx.dsl.component.experimental import placeholders
 from tfx.dsl.components.base import base_component
@@ -33,7 +32,10 @@ from tfx.types import component_spec
 from tfx.types.experimental import simple_artifacts
 from tfx.utils import proto_utils
 
+from google.protobuf import struct_pb2
 from google.protobuf import message
+
+_ph = tfx.dsl.placeholders
 
 _TEST_TWO_STEP_PIPELINE_NAME = 'two-step-pipeline'
 
@@ -47,13 +49,23 @@ _TEST_INPUT_DATA = 'path/to/my/data'
 
 _TEST_MODULE_FILE_LOCATION = 'path/to/my/module_utils.py'
 
-TEST_RUNTIME_CONFIG = pipeline_pb2.PipelineJob.RuntimeConfig(
+TEST_RUNTIME_CONFIG_LEGACY = pipeline_pb2.PipelineJob.RuntimeConfig(
     gcs_output_directory=_TEST_PIPELINE_ROOT,
     parameters={
         'string_param': pipeline_pb2.Value(string_value='test-string'),
         'int_param': pipeline_pb2.Value(int_value=42),
-        'float_param': pipeline_pb2.Value(double_value=3.14)
-    })
+        'float_param': pipeline_pb2.Value(double_value=3.14),
+    },
+)
+
+TEST_RUNTIME_CONFIG = pipeline_pb2.PipelineJob.RuntimeConfig(
+    gcs_output_directory=_TEST_PIPELINE_ROOT,
+    parameter_values={
+        'string_param': struct_pb2.Value(string_value='test-string'),
+        'int_param': struct_pb2.Value(number_value=42),
+        'float_param': struct_pb2.Value(number_value=3.14),
+    },
+)
 
 
 # TODO(b/158245564): Reevaluate whether to keep this test helper function
@@ -102,10 +114,37 @@ def two_step_pipeline_with_dynamic_exec_properties():
       input_date='22-09-26')
   example_gen = tfx.extensions.google_cloud_big_query.BigQueryExampleGen(
       query='SELECT * FROM TABLE',
-      range_config=input_config_generator.outputs['range_config'].future()
-      [0].value).with_beam_pipeline_args([
-          '--runner=DataflowRunner',
-      ])
+      range_config=(
+          input_config_generator.outputs['range_config'].future()[0].value
+      ),
+  ).with_beam_pipeline_args([
+      '--runner=DataflowRunner',
+  ])
+  return tfx.dsl.Pipeline(
+      pipeline_name=_TEST_TWO_STEP_PIPELINE_WITH_DYNAMIC_EXEC_PROPERTIES_NAME,
+      pipeline_root=_TEST_PIPELINE_ROOT,
+      components=[input_config_generator, example_gen],
+      beam_pipeline_args=[
+          '--project=my-gcp-project',
+      ],
+  )
+
+
+def two_step_pipeline_with_illegal_dynamic_exec_property():
+  """Returns a simple 2-step pipeline under test with the second component's execution property declaring an illegally complex placeholder."""
+
+  input_config_generator = range_config_generator(  # pylint: disable=no-value-for-parameter
+      input_date='22-09-26'
+  )
+  example_gen = tfx.extensions.google_cloud_big_query.BigQueryExampleGen(
+      query='SELECT * FROM TABLE',
+      range_config=(
+          input_config_generator.outputs['range_config'].future()[0].value
+          + _ph.execution_invocation().pipeline_run_id
+      ),
+  ).with_beam_pipeline_args([
+      '--runner=DataflowRunner',
+  ])
   return tfx.dsl.Pipeline(
       pipeline_name=_TEST_TWO_STEP_PIPELINE_WITH_DYNAMIC_EXEC_PROPERTIES_NAME,
       pipeline_root=_TEST_PIPELINE_ROOT,
@@ -180,7 +219,6 @@ def create_pipeline_components(
       model=tfx.dsl.Channel(type=tfx.types.standard_artifacts.Model)).with_id(
           'Resolver.latest_model_resolver')
   trainer = tfx.components.Trainer(
-      custom_executor_spec=executor_spec.ExecutorClassSpec(Executor),
       examples=transform.outputs['transformed_examples'],
       schema=schema_gen.outputs['schema'],
       base_model=latest_model_resolver.outputs['model'],
@@ -503,16 +541,29 @@ def pipeline_with_two_container_spec_components_2() -> tfx.dsl.Pipeline:
   )
 
 
-def get_proto_from_test_data(filename: str,
-                             pb_message: message.Message) -> message.Message:
+def get_proto_from_test_data(
+    filename: str, pb_message: message.Message, use_legacy_data: bool = False
+) -> message.Message:
   """Helper function that gets proto from testdata."""
-  filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
+  if use_legacy_data:
+    filepath = os.path.join(
+        os.path.dirname(__file__), 'testdata', 'legacy', filename
+    )
+  else:
+    filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
   return tfx.utils.parse_pbtxt_file(filepath, pb_message)
 
 
-def get_text_from_test_data(filename: str) -> str:
+def get_text_from_test_data(
+    filename: str, use_legacy_data: bool = False
+) -> str:
   """Helper function that gets raw string from testdata."""
-  filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
+  if use_legacy_data:
+    filepath = os.path.join(
+        os.path.dirname(__file__), 'testdata', 'legacy', filename
+    )
+  else:
+    filepath = os.path.join(os.path.dirname(__file__), 'testdata', filename)
   return tfx.dsl.io.fileio.open(filepath, 'rb').read().decode('utf-8')
 
 

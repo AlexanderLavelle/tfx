@@ -18,12 +18,11 @@ import enum
 import functools
 import os
 import re
-from typing import Any, Callable, Dict, List, Set, Union
+from typing import Any, Callable, Optional, Union, cast
 
 from absl import logging
 import attr
 from tfx.dsl.io import fileio
-from tfx.dsl.placeholder import placeholder as ph
 from tfx.orchestration.portable import data_types
 from tfx.proto.orchestration import placeholder_pb2
 from tfx.types import artifact
@@ -32,8 +31,9 @@ from tfx.types import value_artifact
 from tfx.utils import json_utils
 from tfx.utils import proto_utils
 
-from google.protobuf.internal import containers
-from google.protobuf.pyext import _message
+from google.protobuf import any_pb2
+from google.protobuf import descriptor as descriptor_lib
+from google.protobuf import descriptor_pool
 from google.protobuf import json_format
 from google.protobuf import message
 from google.protobuf import text_format
@@ -56,21 +56,34 @@ class ResolutionContext:
       render all kinds of placeholders.
     executor_spec: An executor spec proto for rendering context placeholder.
     platform_config: A platform config proto for rendering context placeholder.
+    pipeline_platform_config: A pipeline-level config proto for rendering
+      context placeholder.
   """
   exec_info: data_types.ExecutionInfo = None
   executor_spec: message.Message = None
   platform_config: message.Message = None
+  pipeline_platform_config: message.Message = None
 
 
 # A Placeholder Expression can be resolved to the following types:
 #   - basic types from MLMD: int, float, str
 #   - primitive type from proto field access: bool
 #   - container type from list exec property or proto field access: list
+#   - proto type: message.Message
 #
 # Note: Pytype's int includes long from Python3
 # Placeholder does not support bytes, which may result from proto field access.
 # Please use base64 encode operator to explicitly convert it into str.
-_PlaceholderResolvedTypes = (int, float, str, bool, type(None), list, dict)
+_PlaceholderResolvedTypes = (
+    int,
+    float,
+    str,
+    bool,
+    type(None),
+    list,
+    dict,
+    message.Message,
+)
 PlaceholderResolvedTypeHints = Union[_PlaceholderResolvedTypes]
 
 
@@ -99,7 +112,11 @@ def resolve_placeholder_expression(
   except NullDereferenceError as err:
     logging.warning(
         "Dereferenced None during placeholder evaluation. Ignoring.")
-    logging.warning("Placeholder=%s", err.placeholder)
+    logging.warning(
+        "When evaluating expression=%s, failed to resolve placeholder=%r.",
+        debug_str(expression),
+        err.placeholder,
+    )
     return None
   except Exception as e:
     raise ValueError(
@@ -110,6 +127,13 @@ def resolve_placeholder_expression(
     raise ValueError(f"Placeholder {debug_str(expression)} evaluates to "
                      f"an unsupported type: {type(result)}.")
   return result
+
+
+def empty_placeholder_context() -> ResolutionContext:
+  """Returns an empty placeholder context."""
+  return ResolutionContext(
+      exec_info=data_types.ExecutionInfo(),
+  )
 
 
 class _Operation(enum.Enum):
@@ -124,9 +148,16 @@ class _Operation(enum.Enum):
 
 
 def _resolve_and_ensure_boolean(
-    resolve_fn: Callable[[placeholder_pb2.PlaceholderExpression], Any],
+    resolve_fn: Callable[
+        [
+            placeholder_pb2.PlaceholderExpression,
+            Optional[descriptor_pool.DescriptorPool],
+        ],
+        Any,
+    ],
     expression: placeholder_pb2.PlaceholderExpression,
     error_message: str,
+    pool: Optional[descriptor_pool.DescriptorPool],
 ) -> bool:
   # TODO(b/173529355): Block invalid placeholders during compilation time
   """Ensures that expression resolves to boolean.
@@ -142,6 +173,7 @@ def _resolve_and_ensure_boolean(
     expression: The placeholder expression to resolve.
     error_message: The error message to display if the expression does not
       resolve to a boolean type.
+    pool: Descriptor pool to pass down to nested resolutions.
 
   Returns:
     The resolved boolean value.
@@ -149,7 +181,7 @@ def _resolve_and_ensure_boolean(
   Raises:
     ValueError if expression does not resolve to boolean type.
   """
-  value = resolve_fn(expression)
+  value = resolve_fn(expression, pool)
   if isinstance(value, bool):
     return value
   raise ValueError(f"{error_message}\n"
@@ -160,7 +192,7 @@ def _resolve_and_ensure_boolean(
 
 # Dictionary of registered placeholder operators,
 # maps from operator proto type names to actual operator functions.
-_PLACEHOLDER_OPERATORS: Dict[str, Callable[..., Any]] = {}
+_PLACEHOLDER_OPERATORS: dict[str, Callable[..., Any]] = {}
 
 
 def _register(op_proto):
@@ -183,30 +215,38 @@ class _ExpressionResolver:
 
   def __init__(self, context: ResolutionContext):
     self._resolution_values = {
-        placeholder_pb2.Placeholder.Type.INPUT_ARTIFACT:
-            context.exec_info.input_dict,
-        placeholder_pb2.Placeholder.Type.OUTPUT_ARTIFACT:
-            context.exec_info.output_dict,
-        placeholder_pb2.Placeholder.Type.EXEC_PROPERTY:
-            context.exec_info.exec_properties,
+        placeholder_pb2.Placeholder.Type.INPUT_ARTIFACT: (
+            context.exec_info.input_dict
+        ),
+        placeholder_pb2.Placeholder.Type.OUTPUT_ARTIFACT: (
+            context.exec_info.output_dict
+        ),
+        placeholder_pb2.Placeholder.Type.EXEC_PROPERTY: (
+            context.exec_info.exec_properties
+        ),
         placeholder_pb2.Placeholder.Type.RUNTIME_INFO: {
-            ph.RuntimeInfoKey.EXECUTOR_SPEC.value: context.executor_spec,
-            ph.RuntimeInfoKey.PLATFORM_CONFIG.value: context.platform_config,
+            "executor_spec": context.executor_spec,
+            "platform_config": context.platform_config,
+            "pipeline_platform_config": context.pipeline_platform_config,
         },
-        placeholder_pb2.Placeholder.Type.EXEC_INVOCATION:
-            context.exec_info.to_proto(),
-        placeholder_pb2.Placeholder.Type.ENVIRONMENT_VARIABLE:
-            os.environ.get,
+        placeholder_pb2.Placeholder.Type.EXEC_INVOCATION: (
+            context.exec_info.to_proto()
+        ),
+        placeholder_pb2.Placeholder.Type.ENVIRONMENT_VARIABLE: os.environ.get,
     }
 
-  def resolve(self, expression: placeholder_pb2.PlaceholderExpression) -> Any:
+  def resolve(
+      self,
+      expression: placeholder_pb2.PlaceholderExpression,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> Any:
     """Recursively evaluates a placeholder expression."""
     if expression.HasField("value"):
       return getattr(expression.value, expression.value.WhichOneof("value"))
     elif expression.HasField("placeholder"):
       return self._resolve_placeholder(expression.placeholder)
     elif expression.HasField("operator"):
-      return self._resolve_placeholder_operator(expression.operator)
+      return self._resolve_placeholder_operator(expression.operator, pool=pool)
     else:
       raise ValueError("Unexpected placeholder expression type: "
                        f"{expression.WhichOneof('expression_type')}.")
@@ -242,7 +282,9 @@ class _ExpressionResolver:
       raise NullDereferenceError(placeholder) from e
 
   def _resolve_placeholder_operator(
-      self, placeholder_operator: placeholder_pb2.PlaceholderExpressionOperator
+      self,
+      placeholder_operator: placeholder_pb2.PlaceholderExpressionOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
   ) -> Any:
     """Evaluates a placeholder operator by dispatching to the operator methods."""
     operator_name = placeholder_operator.WhichOneof("operator_type")
@@ -253,13 +295,16 @@ class _ExpressionResolver:
       raise KeyError(
           f"Unsupported placeholder operator: {operator_pb.DESCRIPTOR.name}."
       ) from e
-    return operator_fn(self, operator_pb)
+    return operator_fn(self, operator_pb, pool)
 
   @_register(placeholder_pb2.ArtifactUriOperator)
   def _resolve_artifact_uri_operator(
-      self, op: placeholder_pb2.ArtifactUriOperator) -> str:
+      self,
+      op: placeholder_pb2.ArtifactUriOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
     """Evaluates the artifact URI operator."""
-    resolved_artifact = self.resolve(op.expression)
+    resolved_artifact = self.resolve(op.expression, pool)
     if resolved_artifact is None:
       raise NullDereferenceError(op.expression)
     if not isinstance(resolved_artifact, artifact.Artifact):
@@ -273,9 +318,12 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.ArtifactValueOperator)
   def _resolve_artifact_value_operator(
-      self, op: placeholder_pb2.ArtifactValueOperator) -> str:
+      self,
+      op: placeholder_pb2.ArtifactValueOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
     """Evaluates the artifact value operator."""
-    resolved_artifact = self.resolve(op.expression)
+    resolved_artifact = self.resolve(op.expression, pool)
     if resolved_artifact is None:
       raise NullDereferenceError(op.expression)
     if not isinstance(resolved_artifact, value_artifact.ValueArtifact):
@@ -285,20 +333,37 @@ class _ExpressionResolver:
     return resolved_artifact.read()
 
   @_register(placeholder_pb2.ConcatOperator)
-  def _resolve_concat_operator(self, op: placeholder_pb2.ConcatOperator) -> str:
+  def _resolve_concat_operator(
+      self,
+      op: placeholder_pb2.ConcatOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
     """Evaluates the concat operator."""
     parts = []
     for e in op.expressions:
-      value = self.resolve(e)
+      value = self.resolve(e, pool)
       if value is None:
         raise NullDereferenceError(e)
       parts.append(value)
     return "".join(str(part) for part in parts)
 
+  @_register(placeholder_pb2.JoinPathOperator)
+  def _resolve_join_path_operator(
+      self,
+      op: placeholder_pb2.JoinPathOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
+    """Evaluates the join path operator."""
+    return os.path.join(*[self.resolve(arg, pool) for arg in op.expressions])
+
   @_register(placeholder_pb2.IndexOperator)
-  def _resolve_index_operator(self, op: placeholder_pb2.IndexOperator) -> Any:
+  def _resolve_index_operator(
+      self,
+      op: placeholder_pb2.IndexOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> Any:
     """Evaluates the index operator."""
-    value = self.resolve(op.expression)
+    value = self.resolve(op.expression, pool)
     if value is None or not value:
       raise NullDereferenceError(op.expression)
     index_or_key = op.key if op.key else op.index
@@ -311,9 +376,12 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.ArtifactPropertyOperator)
   def _resolve_property_operator(
-      self, op: placeholder_pb2.ArtifactPropertyOperator) -> Any:
+      self,
+      op: placeholder_pb2.ArtifactPropertyOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> Any:
     """Evaluates the artifact property operator."""
-    value = self.resolve(op.expression)
+    value = self.resolve(op.expression, pool)
     if value is None or not value:
       raise NullDereferenceError(op.expression)
     if not isinstance(value, artifact.Artifact):
@@ -329,24 +397,33 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.Base64EncodeOperator)
   def _resolve_base64_encode_operator(
-      self, op: placeholder_pb2.Base64EncodeOperator) -> str:
+      self,
+      op: placeholder_pb2.Base64EncodeOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
     """Evaluates the Base64 encode operator."""
-    value = self.resolve(op.expression)
+    value = self.resolve(op.expression, pool)
     if value is None:
       raise NullDereferenceError(op.expression)
     if isinstance(value, str):
-      return base64.urlsafe_b64encode(value.encode()).decode("ascii")
-    elif isinstance(value, bytes):
-      return base64.urlsafe_b64encode(value).decode("ascii")
+      value = value.encode()
+    if isinstance(value, bytes):
+      if op.is_standard_b64:
+        return base64.b64encode(value).decode("ascii")
+      else:
+        return base64.urlsafe_b64encode(value).decode("ascii")
     else:
       raise ValueError(
           f"Failed to Base64 encode {value} of type {type(value)}.")
 
   @_register(placeholder_pb2.ListSerializationOperator)
   def _resolve_list_serialization_operator(
-      self, op: placeholder_pb2.ListSerializationOperator) -> str:
+      self,
+      op: placeholder_pb2.ListSerializationOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
     """Evaluates the list operator."""
-    value = self.resolve(op.expression)
+    value = self.resolve(op.expression, pool)
     if value is None:
       raise NullDereferenceError(op.expression)
     elif not all(isinstance(val, (str, int, float, bool)) for val in value):
@@ -366,19 +443,56 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.ListConcatOperator)
   def _resolve_list_concat_operator(
-      self, op: placeholder_pb2.ListConcatOperator) -> List[Any]:
+      self,
+      op: placeholder_pb2.ListConcatOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> list[Any]:
+    """Evaluates the list concat operator."""
     result = []
     for sub_expression in op.expressions:
-      value = self.resolve(sub_expression)
-      if value is None:
-        raise NullDereferenceError(sub_expression)
+      try:
+        value = self.resolve(sub_expression, pool)
+      except NullDereferenceError:
+        value = None
       result.append(value)
     return result
 
+  @_register(placeholder_pb2.MakeDictOperator)
+  def _resolve_make_dict_operator(
+      self,
+      op: placeholder_pb2.MakeDictOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> dict[str, Any]:
+    """Evaluates the make dict operator."""
+    result = {}
+    for entry in op.entries:
+      try:
+        key = self.resolve(entry.key, pool)
+      except NullDereferenceError as e:
+        raise ValueError("A key resolved to None") from e
+      if not isinstance(key, str):
+        raise ValueError(f"Expected string for dict key, got {key!r}.")
+
+      try:
+        value = self.resolve(entry.value, pool)
+        if value is not None:
+          result[key] = value
+      except NullDereferenceError:
+        logging.info(
+            "Dropping key %r from placeholer dict because it evaluated to None",
+            key,
+        )
+        pass  # Drop None values.
+    return result
+
   @_register(placeholder_pb2.ProtoOperator)
-  def _resolve_proto_operator(self, op: placeholder_pb2.ProtoOperator) -> Any:
+  def _resolve_proto_operator(
+      self,
+      op: placeholder_pb2.ProtoOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> Any:
     """Evaluates the proto operator."""
-    raw_message = self.resolve(op.expression)
+    raw_message = self.resolve(op.expression, pool)
     if raw_message is None:
       raise NullDereferenceError(op.expression)
 
@@ -431,11 +545,21 @@ class _ExpressionResolver:
       return value
 
     # Return repeated fields as list.
-    if isinstance(
-        value,
-        (_message.RepeatedCompositeContainer, _message.RepeatedScalarContainer,
-         containers.RepeatedCompositeFieldContainer,
-         containers.RepeatedScalarFieldContainer)):
+    # TODO(b/292040530): It was originally done with
+    # if isinstance(value,(_message.RepeatedCompositeContainer,
+    #    _message.RepeatedScalarContainer,
+    #     containers.RepeatedCompositeFieldContainer,
+    #     containers.RepeatedScalarFieldContainer))
+    # however, it was not supported on an environment that Protoc
+    # (google.protobuf.pyext._message) is not installed but only a pure Python
+    # Protobuf presents. (ex. OSS macos Python 3.10) This is a new workaround
+    # for pure Python users.
+    if type(value).__name__ in (
+        "RepeatedCompositeContainer",
+        "RepeatedScalarContainer",
+        "RepeatedCompositeFieldContainer",
+        "RepeatedScalarFieldContainer",
+    ):
       return list(value)
 
     if not isinstance(value, message.Message):
@@ -456,16 +580,110 @@ class _ExpressionResolver:
       if op.serialization_format == placeholder_pb2.ProtoOperator.BINARY:
         return value.SerializeToString()
 
-    raise ValueError(
-        "Proto operator resolves to a proto message value. A serialization "
-        "format is needed to render it.")
+    # Otherwise, just return the value as a proto. Note that the top-level
+    # resolve_placeholder_expression() would reject this, but it can be a valid
+    # intermediate value.
+    return value
+
+  def _assign_proto_message(
+      self, out_msg: message.Message, new_value: message.Message
+  ):
+    """Assigns the new_value to the out_msg, even if it's of Any type."""
+    # This comparison uses the full_name string instead of the object itself
+    # because some environments load multiple different instances of the
+    # Any proto.
+    if out_msg.DESCRIPTOR.full_name == any_pb2.Any.DESCRIPTOR.full_name:
+      cast(any_pb2.Any, out_msg).Pack(new_value)
+    else:
+      out_msg.MergeFrom(new_value)
+
+  @_register(placeholder_pb2.MakeProtoOperator)
+  def _resolve_make_proto_operator(
+      self,
+      op: placeholder_pb2.MakeProtoOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> message.Message:
+    """Evaluates the make proto operator."""
+    pool = proto_utils.get_pool_with_descriptors(
+        op.file_descriptors,
+        # If this is the outermost _resolve_make_proto_operator() call, we
+        # create a fresh DescriptorPool and use it for all MakeProtoOperator
+        # resolving under this placeholder. It's important that we don't leak
+        # our (compressed, incomplete) descriptors to the outside world.
+        pool or descriptor_pool.DescriptorPool(),
+    )
+    # Start with the base proto.
+    result = proto_utils.unpack_proto_any(op.base, pool)
+    # Then pile all the fields on top.
+    for key, value in op.fields.items():
+      descriptor = result.DESCRIPTOR.fields_by_name[key]
+      field_name = f"{result.DESCRIPTOR.full_name}.{key}"
+      # First resolve the placeholder value of the field.
+      try:
+        value = self.resolve(value, pool)
+      except NullDereferenceError:
+        value = None
+      except Exception as e:
+        raise ValueError(f"Failed to resolve field {field_name}") from e
+
+      # Drop fields that evaluate to None.
+      if value is None:
+        if descriptor.label == descriptor_lib.FieldDescriptor.LABEL_REQUIRED:
+          raise ValueError(
+              f"Placeholder for required field {field_name} resolved to None."
+          )
+        continue
+
+      # Then write the resolved value into the output proto.
+      if (  # If it's a map<> field.
+          descriptor.message_type
+          and descriptor.message_type.has_options
+          and descriptor.message_type.GetOptions().map_entry
+      ):
+        if not isinstance(value, dict):
+          raise ValueError(
+              f"Expected dict value for field {field_name}, but the "
+              f"placeholder resolved to {value!r}"
+          )
+        out_dict = getattr(result, key)
+        for k, v in value.items():
+          if isinstance(v, message.Message):
+            self._assign_proto_message(out_dict[k], v)
+          else:
+            out_dict[k] = v
+      elif descriptor.label == descriptor_lib.FieldDescriptor.LABEL_REPEATED:
+        if not isinstance(value, list):
+          raise ValueError(
+              f"Expected list value for field {field_name}, but the placeholder"
+              f" resolved to {value!r}"
+          )
+        out_list = getattr(result, key)
+        for item in value:
+          if item is not None:
+            if isinstance(item, message.Message):
+              self._assign_proto_message(out_list.add(), item)
+            else:
+              out_list.append(item)
+      elif descriptor.type == descriptor_lib.FieldDescriptor.TYPE_MESSAGE:
+        self._assign_proto_message(getattr(result, key), value)
+      elif descriptor.type == descriptor_lib.FieldDescriptor.TYPE_ENUM:
+        if isinstance(value, str):
+          value = descriptor.enum_type.values_by_name[value].number
+        setattr(result, key, value)
+      else:
+        setattr(result, key, value)
+
+    return result
 
   @_register(placeholder_pb2.ComparisonOperator)
   def _resolve_comparison_operator(
-      self, op: placeholder_pb2.ComparisonOperator) -> bool:
+      self,
+      op: placeholder_pb2.ComparisonOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> bool:
     """Evaluates the comparison operator."""
-    lhs_value = self.resolve(op.lhs)
-    rhs_value = self.resolve(op.rhs)
+    lhs_value = self.resolve(op.lhs, pool)
+    rhs_value = self.resolve(op.rhs, pool)
     if op.op == _Operation.EQUAL.value:
       return bool(lhs_value == rhs_value)
     elif op.op == _Operation.LESS_THAN.value:
@@ -477,12 +695,16 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.UnaryLogicalOperator)
   def _resolve_unary_logical_operator(
-      self, op: placeholder_pb2.UnaryLogicalOperator) -> bool:
+      self,
+      op: placeholder_pb2.UnaryLogicalOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> bool:
     """Evaluates the unary logical operator."""
     error_message = (
         "Unary logical operations' sub-expression must resolve to bool.")
-    value = _resolve_and_ensure_boolean(self.resolve, op.expression,
-                                        error_message)
+    value = _resolve_and_ensure_boolean(
+        self.resolve, op.expression, error_message, pool
+    )
     if op.op == _Operation.NOT.value:
       return not value
 
@@ -490,21 +712,36 @@ class _ExpressionResolver:
 
   @_register(placeholder_pb2.BinaryLogicalOperator)
   def _resolve_binary_logical_operator(
-      self, op: placeholder_pb2.BinaryLogicalOperator) -> bool:
+      self,
+      op: placeholder_pb2.BinaryLogicalOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> bool:
     """Evaluates the binary logical operator."""
     error_message = (
         "Binary logical operations' sub-expression must resolve to bool. "
         "{} is not bool.")
-    lhs_value = _resolve_and_ensure_boolean(self.resolve, op.lhs,
-                                            error_message.format("lhs"))
-    rhs_value = _resolve_and_ensure_boolean(self.resolve, op.rhs,
-                                            error_message.format("rhs"))
+    lhs_value = _resolve_and_ensure_boolean(
+        self.resolve, op.lhs, error_message.format("lhs"), pool
+    )
+    rhs_value = _resolve_and_ensure_boolean(
+        self.resolve, op.rhs, error_message.format("rhs"), pool
+    )
     if op.op == _Operation.AND.value:
       return lhs_value and rhs_value
     elif op.op == _Operation.OR.value:
       return lhs_value or rhs_value
 
     raise ValueError(f"Unrecognized binary logical operation {op.op}.")
+
+  @_register(placeholder_pb2.DirNameOperator)
+  def _resolve_dir_name_operator(
+      self,
+      op: placeholder_pb2.DirNameOperator,
+      pool: Optional[descriptor_pool.DescriptorPool] = None,
+  ) -> str:
+    """Returns the directory name of the file."""
+    path = self.resolve(op.expression, pool)
+    return os.path.dirname(path)
 
 
 def debug_str(expression: placeholder_pb2.PlaceholderExpression) -> str:
@@ -566,6 +803,12 @@ def debug_str(expression: placeholder_pb2.PlaceholderExpression) -> str:
     if operator_name == "concat_op":
       expression_str = " + ".join(debug_str(e) for e in operator_pb.expressions)
       return f"({expression_str})"
+
+    if operator_name == "join_path_op":
+      sub_expression_str = ", ".join(
+          debug_str(e) for e in operator_pb.expressions
+      )
+      return f"join_path({sub_expression_str})"
 
     if operator_name == "index_op":
       sub_expression_str = debug_str(operator_pb.expression)
@@ -629,13 +872,31 @@ def debug_str(expression: placeholder_pb2.PlaceholderExpression) -> str:
       expression_str = ", ".join(debug_str(e) for e in operator_pb.expressions)
       return f"to_list([{expression_str}])"
 
+    if operator_name == "make_dict_op":
+      expression_str = ", ".join(
+          f"{debug_str(entry.key)}: {debug_str(entry.value)}"
+          for entry in operator_pb.entries
+      )
+      return f"make_dict({{{expression_str}}})"
+
+    if operator_name == "make_proto_op":
+      expression_str = ", ".join(
+          f"{field_name}={debug_str(field_value)}"
+          for field_name, field_value in sorted(operator_pb.fields.items())
+      )
+      return f"MakeProto({str(operator_pb.base).strip()}, {expression_str})"
+
+    if operator_name == "dir_name_op":
+      expression_str = debug_str(operator_pb.expression)
+      return f"dirname({expression_str})"
+
     return "Unknown placeholder operator"
 
   return "Unknown placeholder expression"
 
 
 @functools.lru_cache(maxsize=1)
-def _get_all_operators() -> Dict[str, Set[str]]:
+def _get_all_operators() -> dict[str, set[str]]:
   """Returns fields contained within operator_type messages, by field name."""
   return {
       op: set(f.name for f in desc.message_type.fields)
@@ -644,7 +905,7 @@ def _get_all_operators() -> Dict[str, Set[str]]:
 
 
 @functools.lru_cache(maxsize=1)
-def get_unary_operator_names() -> Set[str]:
+def get_unary_operator_names() -> set[str]:
   """Returns all unary placeholder operators."""
   return {
       op
@@ -654,13 +915,13 @@ def get_unary_operator_names() -> Set[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def get_binary_operator_names() -> Set[str]:
+def get_binary_operator_names() -> set[str]:
   """Returns all binary placeholder operators."""
   return {op for op, fields in _get_all_operators().items() if "lhs" in fields}
 
 
 @functools.lru_cache(maxsize=1)
-def get_nary_operator_names() -> Set[str]:
+def get_nary_operator_names() -> set[str]:
   """Returns all n-ary placeholder operators."""
   return {
       op
@@ -671,7 +932,7 @@ def get_nary_operator_names() -> Set[str]:
 
 def get_all_types_in_placeholder_expression(
     placeholder: placeholder_pb2.PlaceholderExpression,
-) -> Set["placeholder_pb2.Placeholder.Type"]:
+) -> set["placeholder_pb2.Placeholder.Type"]:
   """Returns all Placeholder.Type contained in a PlaceholderExpression."""
   if placeholder.HasField("placeholder"):
     return {placeholder.placeholder.type}
@@ -683,21 +944,26 @@ def get_all_types_in_placeholder_expression(
     operator_name = placeholder.operator.WhichOneof("operator_type")
     operator_pb = getattr(placeholder.operator, operator_name)
 
-    # Unary operators.
     if operator_name in get_unary_operator_names():
-      return get_all_types_in_placeholder_expression(operator_pb.expression)
+      expressions = [operator_pb.expression]
+    elif operator_name in get_binary_operator_names():
+      expressions = [operator_pb.lhs, operator_pb.rhs]
+    elif operator_name in get_nary_operator_names():
+      expressions = operator_pb.expressions
+    elif operator_name == "make_proto_op":
+      expressions = operator_pb.fields.values()
+    elif operator_name == "make_dict_op":
+      expressions = [entry.key for entry in operator_pb.entries]
+      expressions += [entry.value for entry in operator_pb.entries]
+    else:
+      raise ValueError(
+          f"Unrecognized placeholder operator {operator_name} in expression: "
+          f"{placeholder}"
+      )
 
-    # Binary operators.
-    if operator_name in get_binary_operator_names():
-      return get_all_types_in_placeholder_expression(
-          operator_pb.lhs
-      ) | get_all_types_in_placeholder_expression(operator_pb.rhs)
-
-    # N-ary operators.
-    if operator_name in get_nary_operator_names():
-      types = set()
-      for expression in operator_pb.expressions:
-        types |= get_all_types_in_placeholder_expression(expression)
-      return types
+    types = set()
+    for expression in expressions:
+      types |= get_all_types_in_placeholder_expression(expression)
+    return types
 
   raise ValueError(f"Unrecognized placeholder expression: {placeholder}")

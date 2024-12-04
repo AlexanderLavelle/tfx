@@ -46,9 +46,9 @@ class ResolverStrategy(abc.ABC):
   to express the input resolution logic. Currently TFX supports the following
   builtin ResolverStrategy:
 
-  - [LatestArtifactStrategy](/tfx/api_docs/python/tfx/v1/dsl/experimental/LatestArtifactStrategy)
-  - [LatestBlessedModelStrategy](/tfx/api_docs/python/tfx/v1/dsl/experimental/LatestBlessedModelStrategy)
-  - [SpanRangeStrategy](/tfx/api_docs/python/tfx/v1/dsl/experimental/SpanRangeStrategy)
+  - [LatestArtifactStrategy][tfx.v1.dsl.experimental.LatestArtifactStrategy]
+  - [LatestBlessedModelStrategy][tfx.v1.dsl.experimental.LatestBlessedModelStrategy]
+  - [SpanRangeStrategy][tfx.v1.dsl.experimental.SpanRangeStrategy]
 
   A resolver strategy defines a type behavior used for input selection. A
   resolver strategy subclass must override the `resolve_artifacts()` function
@@ -81,7 +81,7 @@ class ResolverStrategy(abc.ABC):
 
     Returns:
       If all entries has enough data after the resolving, returns the resolved
-      input_dict. Otherise, return None.
+        input_dict. Otherise, return None.
     """
 
 
@@ -109,8 +109,7 @@ class _ResolverDriver(base_driver.BaseDriver):
       pipeline_info: data_types.PipelineInfo,
       input_channels: Mapping[str, types.BaseChannel],
   ) -> Dict[str, List[types.Artifact]]:
-    pipeline_context = self._metadata_handler.get_pipeline_context(
-        pipeline_info)
+    pipeline_context = self._metadata_handle.get_pipeline_context(pipeline_info)
     if pipeline_context is None:
       raise RuntimeError(f'Pipeline context absent for {pipeline_info}.')
 
@@ -121,11 +120,12 @@ class _ResolverDriver(base_driver.BaseDriver):
       # support all BaseChannel types. Use a common input resolution stack
       # instead.
       for channel in channel_utils.get_individual_channels(c):
-        artifacts = self._metadata_handler.get_qualified_artifacts(
+        artifacts = self._metadata_handle.get_qualified_artifacts(
             contexts=[pipeline_context],
             type_name=channel.type_name,
             producer_component_id=channel.producer_component_id,
-            output_key=channel.output_key)
+            output_key=channel.output_key,
+        )
         artifacts_by_id.update({a.id: a for a in artifacts})
       result[key] = list(artifacts_by_id.values())
     return result
@@ -142,19 +142,22 @@ class _ResolverDriver(base_driver.BaseDriver):
       component_info: data_types.ComponentInfo,
   ) -> data_types.ExecutionDecision:
     # Registers contexts and execution
-    contexts = self._metadata_handler.register_pipeline_contexts_if_not_exists(
-        pipeline_info)
-    execution = self._metadata_handler.register_execution(
+    contexts = self._metadata_handle.register_pipeline_contexts_if_not_exists(
+        pipeline_info
+    )
+    execution = self._metadata_handle.register_execution(
         exec_properties=exec_properties,
         pipeline_info=pipeline_info,
         component_info=component_info,
-        contexts=contexts)
+        contexts=contexts,
+    )
     # Gets resolved artifacts.
     resolved = self._build_input_dict(pipeline_info, input_dict)
     maybe_strategy = self._maybe_get_strategy(exec_properties)
     if maybe_strategy:
       resolved = maybe_strategy.resolve_artifacts(
-          self._metadata_handler.store, resolved)
+          self._metadata_handle.store, resolved
+      )
     if resolved is None:
       # No inputs available. Still driver needs an ExecutionDecision, so use a
       # dummy dict with no artifacts.
@@ -165,12 +168,13 @@ class _ResolverDriver(base_driver.BaseDriver):
       c.set_artifacts(resolved[k])
     # Updates execution to reflect artifact resolution results and mark
     # as cached.
-    self._metadata_handler.update_execution(
+    self._metadata_handle.update_execution(
         execution=execution,
         component_info=component_info,
         output_artifacts=resolved,
         execution_state=metadata.EXECUTION_STATE_CACHED,
-        contexts=contexts)
+        contexts=contexts,
+    )
 
     return data_types.ExecutionDecision(
         input_dict={},
@@ -189,27 +193,31 @@ class Resolver(base_node.BaseNode):
   To use Resolver, pass the followings to the Resolver constructor:
 
   * Name of the Resolver instance
-  * A subclass of ResolverStrategy
-  * Configs that will be used to construct an instance of ResolverStrategy
+  * A subclass of [ResolverStrategy][tfx.v1.dsl.experimental.ResolverStrategy]
+  * Configs that will be used to construct an instance of [ResolverStrategy][tfx.v1.dsl.experimental.ResolverStrategy]
   * Channels to resolve with their tag, in the form of kwargs
 
   Here is an example:
 
-  ```
+  ``` {.python .no-copy}
   example_gen = ImportExampleGen(...)
   examples_resolver = Resolver(
-        strategy_class=tfx.dsl.experimental.SpanRangeStrategy,
-        config={'range_config': range_config},
-        examples=Channel(type=Examples, producer_component_id=example_gen.id)
-        ).with_id('Resolver.span_resolver')
+      strategy_class=tfx.dsl.experimental.SpanRangeStrategy,
+      config={"range_config": range_config},
+      examples=Channel(
+          type=Examples,
+          producer_component_id=example_gen.id,
+      ),
+  ).with_id("Resolver.span_resolver")
   trainer = Trainer(
-      examples=examples_resolver.outputs['examples'],
-      ...)
+      examples=examples_resolver.outputs["examples"],
+      ...,
+  )
   ```
 
-  You can find experimental `ResolverStrategy` classes under
-  `tfx.v1.dsl.experimental` module, including `LatestArtifactStrategy`,
-  `LatestBlessedModelStrategy`, `SpanRangeStrategy`, etc.
+  You can find experimental [`ResolverStrategy`][tfx.v1.dsl.experimental.ResolverStrategy] classes under
+  [`tfx.v1.dsl.experimental`][tfx.v1.dsl.experimental] module, including [`LatestArtifactStrategy`][tfx.v1.dsl.experimental.LatestArtifactStrategy],
+  `LatestBlessedModelStrategy`, [`SpanRangeStrategy`][tfx.v1.dsl.experimental.SpanRangeStrategy], etc.
   """
 
   def __init__(self,

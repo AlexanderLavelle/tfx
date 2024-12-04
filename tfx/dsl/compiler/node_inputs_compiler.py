@@ -13,18 +13,23 @@
 # limitations under the License.
 """Compiler submodule specialized for NodeInputs."""
 
-from typing import Type, cast
+from collections.abc import Iterable, Sequence
+import functools
+from typing import Optional, Type, cast
 
 from tfx import types
 from tfx.dsl.compiler import compiler_context
 from tfx.dsl.compiler import compiler_utils
 from tfx.dsl.compiler import constants
+from tfx.dsl.compiler import node_contexts_compiler
 from tfx.dsl.components.base import base_component
 from tfx.dsl.components.base import base_node
 from tfx.dsl.experimental.conditionals import conditional
 from tfx.dsl.input_resolution import resolver_op
+from tfx.dsl.placeholder import artifact_placeholder
 from tfx.dsl.placeholder import placeholder
 from tfx.orchestration import data_types_utils
+from tfx.orchestration import pipeline
 from tfx.proto.orchestration import metadata_pb2
 from tfx.proto.orchestration import pipeline_pb2
 from tfx.types import channel as channel_types
@@ -34,6 +39,19 @@ from tfx.types import value_artifact
 from tfx.utils import deprecation_utils
 from tfx.utils import name_utils
 from tfx.utils import typing_utils
+
+from ml_metadata.proto import metadata_store_pb2
+
+_PropertyPredicate = pipeline_pb2.PropertyPredicate
+
+
+def _get_tfx_value(value: str) -> pipeline_pb2.Value:
+  """Returns a TFX Value containing the provided string."""
+  return pipeline_pb2.Value(
+      field_value=data_types_utils.set_metadata_value(
+          metadata_store_pb2.Value(), value
+      )
+  )
 
 
 def _compile_input_graph(
@@ -119,6 +137,27 @@ def _compile_input_graph(
   return input_graph_id
 
 
+def _compile_channel_pb_contexts(
+    # TODO(b/264728226) Can flatten these args to make it more readable.
+    types_values_and_predicates: Iterable[
+        tuple[str, pipeline_pb2.Value, Optional[_PropertyPredicate]]
+    ],
+    result: pipeline_pb2.InputSpec.Channel,
+):
+  """Adds contexts to the channel."""
+  for (
+      context_type,
+      context_value,
+      predicate,
+  ) in types_values_and_predicates:
+    ctx = result.context_queries.add()
+    ctx.type.name = context_type
+    if context_value:
+      ctx.name.CopyFrom(context_value)
+    if predicate:
+      ctx.property_predicate.CopyFrom(predicate)
+
+
 def _compile_channel_pb(
     artifact_type: Type[types.Artifact],
     pipeline_name: str,
@@ -131,18 +170,56 @@ def _compile_channel_pb(
   result.artifact_query.type.CopyFrom(mlmd_artifact_type)
   result.artifact_query.type.ClearField('properties')
 
-  ctx = result.context_queries.add()
-  ctx.type.name = constants.PIPELINE_CONTEXT_TYPE_NAME
-  ctx.name.field_value.string_value = pipeline_name
-
+  contexts_types_and_values = [(
+      constants.PIPELINE_CONTEXT_TYPE_NAME,
+      _get_tfx_value(pipeline_name),
+      None,
+  )]
   if node_id:
-    ctx = result.context_queries.add()
-    ctx.type.name = constants.NODE_CONTEXT_TYPE_NAME
-    ctx.name.field_value.string_value = compiler_utils.node_context_name(
-        pipeline_name, node_id)
+    contexts_types_and_values.append(
+        (
+            constants.NODE_CONTEXT_TYPE_NAME,
+            _get_tfx_value(
+                compiler_utils.node_context_name(pipeline_name, node_id)
+            ),
+            None,
+        ),
+    )
+  _compile_channel_pb_contexts(contexts_types_and_values, result)
 
   if output_key:
     result.output_key = output_key
+
+
+def _construct_predicate(
+    predicate_names_and_values: Sequence[tuple[str, metadata_store_pb2.Value]],
+) -> Optional[_PropertyPredicate]:
+  """Constructs a PropertyPredicate from a list of name and value pairs."""
+  if not predicate_names_and_values:
+    return None
+
+  predicates = []
+  for name, predicate_value in predicate_names_and_values:
+    predicates.append(
+        _PropertyPredicate(
+            value_comparator=_PropertyPredicate.ValueComparator(
+                property_name=name,
+                op=_PropertyPredicate.ValueComparator.Op.EQ,
+                target_value=pipeline_pb2.Value(field_value=predicate_value),
+                is_custom_property=True,
+            )
+        )
+    )
+
+  def _make_and(lhs, rhs):
+    return _PropertyPredicate(
+        binary_logical_operator=_PropertyPredicate.BinaryLogicalOperator(
+            op=_PropertyPredicate.BinaryLogicalOperator.AND, lhs=lhs, rhs=rhs
+        )
+    )
+
+  if predicates:
+    return functools.reduce(_make_and, predicates)
 
 
 def _compile_input_spec(
@@ -176,7 +253,7 @@ def _compile_input_spec(
     # from the same resolver function output.
     if not hidden:
       # Overwrite hidden = False even for already compiled channel, this is
-      # because we don't know the input should truely be hidden until the
+      # because we don't know the input should truly be hidden until the
       # channel turns out not to be.
       result.inputs[input_key].hidden = False
     return
@@ -196,7 +273,8 @@ def _compile_input_spec(
         pipeline_name=channel.pipeline.id,
         node_id=channel.wrapped.producer_component_id,
         output_key=channel.output_key,
-        result=result.inputs[input_key].channels.add())
+        result=result.inputs[input_key].channels.add(),
+    )
 
   elif isinstance(channel, channel_types.ExternalPipelineChannel):
     channel = cast(channel_types.ExternalPipelineChannel, channel)
@@ -206,12 +284,21 @@ def _compile_input_spec(
         pipeline_name=channel.pipeline_name,
         node_id=channel.producer_component_id,
         output_key=channel.output_key,
-        result=result_input_channel)
+        result=result_input_channel,
+    )
 
-    if channel.pipeline_run_id:
-      ctx = result_input_channel.context_queries.add()
-      ctx.type.name = constants.PIPELINE_RUN_CONTEXT_TYPE_NAME
-      ctx.name.field_value.string_value = channel.pipeline_run_id
+    if channel.pipeline_run_id or channel.run_context_predicates:
+      predicate = _construct_predicate(channel.run_context_predicates)
+      _compile_channel_pb_contexts(
+          [(
+              constants.PIPELINE_RUN_CONTEXT_TYPE_NAME,
+              _get_tfx_value(
+                  channel.pipeline_run_id if channel.pipeline_run_id else ''
+              ),
+              predicate,
+          )],
+          result_input_channel,
+      )
 
     if pipeline_ctx.pipeline.platform_config:
       project_config = (
@@ -233,6 +320,32 @@ def _compile_input_spec(
       )
       result_input_channel.metadata_connection_config.Pack(config)
 
+  # Note that this path is *usually* not taken, as most output channels already
+  # exist in pipeline_ctx.channels, as they are added in after
+  # compiler._generate_input_spec_for_outputs is called.
+  # This path gets taken when a channel is copied, for example by
+  # `as_optional()`, as Channel uses `id` for a hash.
+  elif isinstance(channel, channel_types.OutputChannel):
+    channel = cast(channel_types.Channel, channel)
+    result_input_channel = result.inputs[input_key].channels.add()
+    _compile_channel_pb(
+        artifact_type=channel.type,
+        pipeline_name=pipeline_ctx.pipeline_info.pipeline_name,
+        node_id=channel.producer_component_id,
+        output_key=channel.output_key,
+        result=result_input_channel,
+    )
+    node_contexts = node_contexts_compiler.compile_node_contexts(
+        pipeline_ctx, tfx_node.id
+    )
+    contexts_to_add = []
+    for context_spec in node_contexts.contexts:
+      if context_spec.type.name == constants.PIPELINE_RUN_CONTEXT_TYPE_NAME:
+        contexts_to_add.append(
+            (constants.PIPELINE_RUN_CONTEXT_TYPE_NAME, context_spec.name, None)
+        )
+    _compile_channel_pb_contexts(contexts_to_add, result_input_channel)
+
   elif isinstance(channel, channel_types.Channel):
     channel = cast(channel_types.Channel, channel)
     _compile_channel_pb(
@@ -240,7 +353,8 @@ def _compile_input_spec(
         pipeline_name=pipeline_ctx.pipeline_info.pipeline_name,
         node_id=channel.producer_component_id,
         output_key=channel.output_key,
-        result=result.inputs[input_key].channels.add())
+        result=result.inputs[input_key].channels.add(),
+    )
 
   elif isinstance(channel, channel_types.UnionChannel):
     channel = cast(channel_types.UnionChannel, channel)
@@ -307,20 +421,32 @@ def _compile_conditionals(
     contexts = context.dsl_context_registry.get_contexts(tfx_node)
   except ValueError:
     return
-
   for dsl_context in contexts:
     if not isinstance(dsl_context, conditional.CondContext):
       continue
     cond_context = cast(conditional.CondContext, dsl_context)
     for channel in channel_utils.get_dependent_channels(cond_context.predicate):
+      # Since the channels here are *always* from a CWP, which we now set the
+      # key by default on for OutputChannel, we must re-create the input key if
+      # an output channel is used, otherwise the wrong key may be used by
+      # `get_input_key` (e.g. if the producer component is also used as data
+      # input to the component.)
+      # Note that this means we potentially have several inputs with identical
+      # artifact queries under the hood, which should be optimized away if we
+      # run into performance issues.
+      if isinstance(channel, channel_types.OutputChannel):
+        input_key = compiler_utils.implicit_channel_key(channel)
+      else:
+        input_key = context.get_node_context(tfx_node).get_input_key(channel)
       _compile_input_spec(
           pipeline_ctx=context,
           tfx_node=tfx_node,
-          input_key=context.get_node_context(tfx_node).get_input_key(channel),
+          input_key=input_key,
           channel=channel,
           hidden=False,
           min_count=1,
-          result=result)
+          result=result,
+      )
     cond_id = context.get_conditional_id(cond_context)
     expr = channel_utils.encode_placeholder_with_channels(
         cond_context.predicate, context.get_node_context(tfx_node).get_input_key
@@ -336,7 +462,7 @@ def _compile_inputs_for_dynamic_properties(
   """Compiles additional InputSpecs used in dynamic properties.
 
   Dynamic properties are the execution properties whose value comes from the
-  artifact value. Becauese of that, dynamic property resolution happens after
+  artifact value. Because of that, dynamic property resolution happens after
   the input resolution at orchestrator, so input resolution should include the
   resolved artifacts for the channel on which dynamic properties depend (thus
   `_compile_channel(hidden=False)`).
@@ -346,27 +472,36 @@ def _compile_inputs_for_dynamic_properties(
     tfx_node: A `BaseNode` instance from pipeline DSL.
     result: A `NodeInputs` proto to which the compiled result would be written.
   """
-  for exec_property in tfx_node.exec_properties.values():
-    if not isinstance(exec_property, placeholder.ChannelWrappedPlaceholder):
+  for key, exec_property in tfx_node.exec_properties.items():
+    if not isinstance(exec_property, placeholder.Placeholder):
       continue
-    channel_type = exec_property.channel.type
-    if not typing_utils.is_compatible(
-        channel_type, Type[value_artifact.ValueArtifact]
-    ):
-      raise ValueError(
-          'Dynamic execution property only supports ValueArtifact typed '
-          f'channel. Got {channel_type.TYPE_NAME}.'
+
+    # Validate all the .future().value placeholders. Note that .future().uri is
+    # also allowed and doesn't need additional validation.
+    for p in exec_property.traverse():
+      if isinstance(p, artifact_placeholder._ArtifactValueOperator):  # pylint: disable=protected-access
+        for channel in channel_utils.get_dependent_channels(p):
+          channel_type = channel.type  # is_compatible() needs this variable.
+          if not typing_utils.is_compatible(
+              channel_type, Type[value_artifact.ValueArtifact]
+          ):
+            raise ValueError(
+                'When you pass <channel>.future().value to an execution '
+                'property, the channel must be of a value artifact type '
+                f'(String, Float, ...). Got {channel_type.TYPE_NAME} in exec '
+                f'property {key!r} of node {tfx_node.id!r}.'
+            )
+
+    for channel in channel_utils.get_dependent_channels(exec_property):
+      _compile_input_spec(
+          pipeline_ctx=context,
+          tfx_node=tfx_node,
+          input_key=context.get_node_context(tfx_node).get_input_key(channel),
+          channel=channel,
+          hidden=False,
+          min_count=1,
+          result=result,
       )
-    _compile_input_spec(
-        pipeline_ctx=context,
-        tfx_node=tfx_node,
-        input_key=(
-            context.get_node_context(tfx_node)
-            .get_input_key(exec_property.channel)),
-        channel=exec_property.channel,
-        hidden=False,
-        min_count=1,
-        result=result)
 
 
 def _validate_min_count(
@@ -396,18 +531,27 @@ def _validate_min_count(
   producer_options = channel.producer_component.node_execution_options
   if producer_options and producer_options.success_optional and min_count > 0:
     raise ValueError(
-        f'Node({channel.producer_component}) is set to success_optional '
+        f'Node({channel.producer_component_id}) is set to success_optional '
         f'= True but its consumer Node({consumer_node.id}).inputs[{input_key}] '
-        'has min_count > 0.'
+        'has min_count > 0. The consumer\'s input may need to be optional'
     )
 
   consumer_options = consumer_node.node_execution_options
-  if consumer_options and consumer_options.trigger_strategy == (
-      pipeline_pb2.NodeExecutionOptions.ALL_UPSTREAM_NODES_COMPLETED
-  ) and min_count > 0:
-    raise ValueError(f'Node({consumer_node.id}) has '
-                     'trigger_strategy = ALL_UPSTREAM_NODES_COMPLETED '
-                     f'but its inputs[{input_key}] has min_count > 0.')
+  if (
+      consumer_options
+      and consumer_options.trigger_strategy
+      in (
+          pipeline_pb2.NodeExecutionOptions.ALL_UPSTREAM_NODES_COMPLETED,
+          pipeline_pb2.NodeExecutionOptions.LAZILY_ALL_UPSTREAM_NODES_COMPLETED,
+      )
+      and min_count > 0
+  ):
+    raise ValueError(
+        f'Node({consumer_node.id}) has trigger_strategy ='
+        f' {pipeline_pb2.NodeExecutionOptions.TriggerStrategy.Name(consumer_options.trigger_strategy)} but'
+        f" its inputs[{input_key}] has min_count > 0. The consumer's input may"
+        ' need to be optional'
+    )
 
 
 def compile_node_inputs(
@@ -418,18 +562,37 @@ def compile_node_inputs(
   """Compile NodeInputs from BaseNode input channels."""
   # Compile DSL node inputs.
   for input_key, channel in tfx_node.inputs.items():
-    if (compiler_utils.is_resolver(tfx_node) or
-        (isinstance(tfx_node, base_component.BaseComponent) and
-         tfx_node.spec.is_allow_empty_input(input_key))):
+    if compiler_utils.is_resolver(tfx_node):
       min_count = 0
+    elif isinstance(tfx_node, pipeline.Pipeline):
+      pipeline_inputs_channel = tfx_node.inputs[input_key]
+      min_count = 0 if pipeline_inputs_channel.is_optional else 1
+    elif isinstance(tfx_node, base_component.BaseComponent):
+      spec_param = tfx_node.spec.INPUTS[input_key]
+      if (
+          spec_param.allow_empty_explicitly_set
+          and channel.is_optional is not None
+          and (spec_param.allow_empty != channel.is_optional)
+      ):
+        raise ValueError(
+            f'Node {tfx_node.id} input channel {input_key} allow_empty is set'
+            f' to {spec_param.allow_empty} but the provided channel is'
+            f' {channel.is_optional}. If the component spec explicitly sets'
+            ' allow_empty, then the channel must match.'
+        )
+      elif spec_param.allow_empty or channel.is_optional:
+        min_count = 0
+      else:
+        min_count = 1
     else:
       min_count = 1
-      if isinstance(channel, channel_types.OutputChannel):
-        _validate_min_count(
-            input_key=input_key,
-            min_count=min_count,
-            channel=channel,
-            consumer_node=tfx_node)
+    if isinstance(channel, channel_types.OutputChannel):
+      _validate_min_count(
+          input_key=input_key,
+          min_count=min_count,
+          channel=channel,
+          consumer_node=tfx_node,
+      )
     _compile_input_spec(
         pipeline_ctx=context,
         tfx_node=tfx_node,

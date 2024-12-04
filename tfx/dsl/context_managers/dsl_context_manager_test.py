@@ -15,7 +15,6 @@
 
 from typing import Dict, Any
 
-import tensorflow as tf
 from tfx.dsl.components.base import base_node
 from tfx.dsl.context_managers import dsl_context
 from tfx.dsl.context_managers import dsl_context_manager
@@ -42,12 +41,12 @@ class _FakeContext(dsl_context.DslContext):
   pass
 
 
-class _FakeContextManager(dsl_context_manager.DslContextManager):
+class _FakeContextManager(dsl_context_manager.DslContextManager[Any]):
 
-  def create_context(self) -> _FakeContext:
+  def create_context(self):
     return _FakeContext()
 
-  def enter(self, context: _FakeContext) -> _FakeContext:
+  def enter(self, context):
     return context
 
 
@@ -143,7 +142,7 @@ class ContextManagerTest(test_case_utils.TfxTest):
 
     class UltimateContextManager(_FakeContextManager):
 
-      def enter(self, context: _FakeContext) -> int:
+      def enter(self, context):
         return 42
 
     with UltimateContextManager() as captured:
@@ -176,7 +175,3 @@ class ContextManagerTest(test_case_utils.TfxTest):
     for reg, context in [(inner, c1), (outer, c2)]:
       with self.assertRaisesRegex(ValueError, 'does not exist in the registry'):
         reg.get_nodes(context)
-
-
-if __name__ == '__main__':
-  tf.test.main()

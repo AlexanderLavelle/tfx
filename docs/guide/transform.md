@@ -41,7 +41,7 @@ training process. Common feature transformations include:
     vocabulary) into dense features by finding a meaningful mapping from high-
     dimensional space to low dimensional space. See the [Embeddings unit in the
     Machine-learning Crash Course](
-    https://developers.google.com/machine-learning/crash-course/embedding)
+    https://developers.google.com/machine-learning/crash-course/embeddings)
     for an introduction to embeddings.
 *   **Vocabulary generation**: converting strings or other non-numeric features
     into integers by creating a vocabulary that maps each unique value to an ID
@@ -78,8 +78,9 @@ By contrast, TensorFlow Transform is designed for transformations that require a
 full pass over the data to compute values that are not known in advance. For
 example, vocabulary generation requires a full pass over the data.
 
-Note: These computations are implemented in [Apache Beam](https://beam.apache.org/)
-under the hood.
+!!! Note
+    These computations are implemented in [Apache Beam](https://beam.apache.org/)
+    under the hood.
 
 In addition to computing values using Apache Beam, TensorFlow Transform allows
 users to embed these values into a TensorFlow graph, which can then be loaded
@@ -125,7 +126,7 @@ disk.  As a TFX user, you only have to define a single function called the
 In `preprocessing_fn` you define a series of functions that manipulate the input
 dict of tensors to produce the output dict of tensors. You can find helper
 functions like scale_to_0_1 and compute_and_apply_vocabulary the
-[TensorFlow Transform API](/tfx/transform/api_docs/python/tft) or use
+[TensorFlow Transform API](https://www.tensorflow.org/tfx/transform/api_docs/python/tft) or use
 regular TensorFlow functions as shown below.
 
 ```python
@@ -178,10 +179,11 @@ The `preprocessing_fn` describes a series of operations on tensors (that is,
 `Tensor`s, `SparseTensor`s, or `RaggedTensor`s). In order to define the
 `preprocessing_fn` correctly it is necessary to understand how the data is
 represented as tensors. The input to the `preprocessing_fn` is determined by the
-schema. A [`Schema` proto](https://github.com/tensorflow/metadata/blob/master/tensorflow_metadata/proto/v0/schema.proto#L72)
-is eventually converted to a "feature spec" (sometimes called a
-"parsing spec") that is used for data parsing, see more details about the
-conversion logic [here](https://github.com/tensorflow/metadata/blob/master/tfx_bsl/docs/schema_interpretation.md).
+schema. A
+[`Schema` proto](https://github.com/tensorflow/metadata/blob/master/tensorflow_metadata/proto/v0/schema.proto#L72)
+is eventually converted to a "feature spec" (sometimes called a "parsing spec")
+that is used for data parsing, see more details about the conversion logic
+[here](https://github.com/tensorflow/tfx-bsl/blob/master/tfx_bsl/docs/schema_interpretation.md).
 
 ## Using TensorFlow Transform to handle string labels
 

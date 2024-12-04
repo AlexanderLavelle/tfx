@@ -19,7 +19,8 @@ Experimental: no backwards compatibility guarantees.
 import copy
 import functools
 import types
-from typing import Any, Dict, List, Optional, Type
+import typing
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Protocol, Type, Union
 
 from tfx import types as tfx_types
 from tfx.dsl.component.experimental import function_parser
@@ -36,7 +37,7 @@ from tfx.types import system_executions
 try:
   import apache_beam as beam  # pytype: disable=import-error  # pylint: disable=g-import-not-at-top
   _BeamPipeline = beam.Pipeline
-except ModuleNotFoundError:
+except Exception:  # pylint: disable=broad-exception-caught
   beam = None
   _BeamPipeline = Any
 
@@ -146,7 +147,28 @@ def _assign_returned_values(
   return result
 
 
-class _SimpleComponent(base_component.BaseComponent):
+class BaseFunctionalComponent(base_component.BaseComponent):
+  """Base class for functional components."""
+  # Can be used for platform-specific additional information attached to this
+  # component class.
+  platform_classlevel_extensions: ClassVar[Any] = None
+
+
+class BaseFunctionalComponentFactory(Protocol):
+  """Serves to declare the return type below."""
+
+  platform_classlevel_extensions: Any = None
+
+  def __call__(self, *args: Any, **kwargs: Any) -> BaseFunctionalComponent:
+    """This corresponds to BaseFunctionalComponent.__init__."""
+    ...
+
+  def test_call(self, *args: Any, **kwargs: Any) -> Any:
+    """This corresponds to the static BaseFunctionalComponent.test_call()."""
+    ...
+
+
+class _SimpleComponent(BaseFunctionalComponent):
   """Component whose constructor generates spec instance from arguments."""
 
   def __init__(self, *unused_args, **kwargs):
@@ -270,13 +292,35 @@ class _FunctionBeamExecutor(base_beam_executor.BaseBeamExecutor,
         ))
 
 
+@typing.overload
+def component(func: types.FunctionType, /) -> BaseFunctionalComponentFactory:
+  ...
+
+
+@typing.overload
+def component(
+    *,
+    component_annotation: Optional[
+        type[system_executions.SystemExecution]
+    ] = None,
+    use_beam: bool = False,
+) -> Callable[[types.FunctionType], BaseFunctionalComponentFactory]:
+  ...
+
+
 def component(
     func: Optional[types.FunctionType] = None,
-    component_annotation: Optional[Type[
-        system_executions.SystemExecution]] = None,
+    /,
+    *,
+    component_annotation: Optional[
+        Type[system_executions.SystemExecution]
+    ] = None,
     use_beam: bool = False,
-) -> Any:
-  """Decorator: creates a component from a typehint-annotated Python function.
+) -> Union[
+    BaseFunctionalComponentFactory,
+    Callable[[types.FunctionType], BaseFunctionalComponentFactory],
+]:
+  '''Decorator: creates a component from a typehint-annotated Python function.
 
   This decorator creates a component based on typehint annotations specified for
   the arguments and return value for a Python function. The decorator can be
@@ -308,12 +352,11 @@ def component(
     optional argument.
 
   The return value typehint should be either empty or `None`, in the case of a
-  component function that has no return values, or an instance of
-  `OutputDict(key_1=type_1, ...)`, where each key maps to a given type (each
-  type is a primitive value type, i.e. `int`, `float`, `str`, `bytes`, `bool`
-  `Dict` or  `List`; or `Optional[T]`, where T is a primitive type value, in
-  which case `None` can be returned), to indicate that the return value is a
-  dictionary with specified keys and value types.
+  component function that has no return values, or a `TypedDict` of primitive
+  value types (`int`, `float`, `str`, `bytes`, `bool`, `dict` or `list`; or
+  `Optional[T]`, where T is a primitive type value, in which case `None` can be
+  returned), to indicate that the return value is a dictionary with specified
+  keys and value types.
 
   Note that output artifacts should not be included in the return value
   typehint; they should be included as `OutputArtifact` annotations in the
@@ -325,62 +368,67 @@ def component(
 
   This is example usage of component definition using this decorator:
 
-      from tfx import v1 as tfx
+  ``` python
+  from tfx import v1 as tfx
 
-      InputArtifact = tfx.dsl.components.InputArtifact
-      OutputArtifact = tfx.dsl.components.OutputArtifact
-      Parameter = tfx.dsl.components.Parameter
-      OutputDict = tfx.dsl.components.OutputDict
-      Examples = tfx.types.standard_artifacts.Examples
-      Model = tfx.types.standard_artifacts.Model
+  InputArtifact = tfx.dsl.components.InputArtifact
+  OutputArtifact = tfx.dsl.components.OutputArtifact
+  Parameter = tfx.dsl.components.Parameter
+  Examples = tfx.types.standard_artifacts.Examples
+  Model = tfx.types.standard_artifacts.Model
 
-      @component(component_annotation=tfx.dsl.standard_annotations.Train)
-      def MyTrainerComponent(
-          training_data: InputArtifact[Examples],
-          model: OutputArtifact[Model],
-          dropout_hyperparameter: float,
-          num_iterations: Parameter[int] = 10
-          ) -> OutputDict(loss=float, accuracy=float):
-        '''My simple trainer component.'''
 
-        records = read_examples(training_data.uri)
-        model_obj = train_model(records, num_iterations, dropout_hyperparameter)
-        model_obj.write_to(model.uri)
+  class MyOutput(TypedDict):
+      loss: float
+      accuracy: float
 
-        return {
-          'loss': model_obj.loss,
-          'accuracy': model_obj.accuracy
-        }
 
-      # Example usage in a pipeline graph definition:
-      # ...
-      trainer = MyTrainerComponent(
-          training_data=example_gen.outputs['examples'],
-          dropout_hyperparameter=other_component.outputs['dropout'],
-          num_iterations=1000)
-      pusher = Pusher(model=trainer.outputs['model'])
-      # ...
+  @component(component_annotation=tfx.dsl.standard_annotations.Train)
+  def MyTrainerComponent(
+      training_data: InputArtifact[Examples],
+      model: OutputArtifact[Model],
+      dropout_hyperparameter: float,
+      num_iterations: Parameter[int] = 10,
+  ) -> MyOutput:
+      """My simple trainer component."""
+
+      records = read_examples(training_data.uri)
+      model_obj = train_model(records, num_iterations, dropout_hyperparameter)
+      model_obj.write_to(model.uri)
+
+      return {"loss": model_obj.loss, "accuracy": model_obj.accuracy}
+
+
+  # Example usage in a pipeline graph definition:
+  # ...
+  trainer = MyTrainerComponent(
+      training_data=example_gen.outputs["examples"],
+      dropout_hyperparameter=other_component.outputs["dropout"],
+      num_iterations=1000,
+  )
+  pusher = Pusher(model=trainer.outputs["model"])
+  # ...
+  ```
 
   When the parameter `component_annotation` is not supplied, the default value
   is None. This is another example usage with `component_annotation` = None:
 
-      @component
-      def MyTrainerComponent(
-          training_data: InputArtifact[standard_artifacts.Examples],
-          model: OutputArtifact[standard_artifacts.Model],
-          dropout_hyperparameter: float,
-          num_iterations: Parameter[int] = 10
-          ) -> OutputDict(loss=float, accuracy=float):
-        '''My simple trainer component.'''
+  ``` python
+  @component
+  def MyTrainerComponent(
+      training_data: InputArtifact[standard_artifacts.Examples],
+      model: OutputArtifact[standard_artifacts.Model],
+      dropout_hyperparameter: float,
+      num_iterations: Parameter[int] = 10,
+  ) -> Output:
+      """My simple trainer component."""
 
-        records = read_examples(training_data.uri)
-        model_obj = train_model(records, num_iterations, dropout_hyperparameter)
-        model_obj.write_to(model.uri)
+      records = read_examples(training_data.uri)
+      model_obj = train_model(records, num_iterations, dropout_hyperparameter)
+      model_obj.write_to(model.uri)
 
-        return {
-          'loss': model_obj.loss,
-          'accuracy': model_obj.accuracy
-        }
+      return {"loss": model_obj.loss, "accuracy": model_obj.accuracy}
+  ```
 
   When the parameter `use_beam` is True, one of the parameters of the decorated
   function type-annotated by BeamComponentParameter[beam.Pipeline] and the
@@ -388,17 +436,19 @@ def component(
   with the tfx pipeline's beam_pipeline_args that's shared with other beam-based
   components:
 
-      @component(use_beam=True)
-      def DataProcessingComponent(
-          input_examples: InputArtifact[standard_artifacts.Examples],
-          output_examples: OutputArtifact[standard_artifacts.Examples],
-          beam_pipeline: BeamComponentParameter[beam.Pipeline] = None,
-          ) -> None:
-        '''My simple trainer component.'''
+  ``` python
+  @component(use_beam=True)
+  def DataProcessingComponent(
+      input_examples: InputArtifact[standard_artifacts.Examples],
+      output_examples: OutputArtifact[standard_artifacts.Examples],
+      beam_pipeline: BeamComponentParameter[beam.Pipeline] = None,
+  ) -> None:
+      """My simple trainer component."""
 
-        records = read_examples(training_data.uri)
-        with beam_pipeline as p:
+      records = read_examples(training_data.uri)
+      with beam_pipeline as p:
           ...
+  ```
 
   Experimental: no backwards compatibility guarantees.
 
@@ -412,15 +462,25 @@ def component(
       tfx-pipeline-wise beam_pipeline_args.
 
   Returns:
-    `base_component.BaseComponent` or `base_component.BaseBeamComponent`
-      subclass for the given component executor function.
+    An object that:
+
+      1. you can call like the initializer of a subclass of [`base_component.BaseComponent`][tfx.v1.types.BaseChannel] (or [`base_component.BaseBeamComponent`][tfx.v1.types.BaseBeamComponent]).
+      2. has a test_call() member function for unit testing the inner implementation of the component.
+
+      Today, the returned object is literally a subclass of [BaseComponent][tfx.v1.types.BaseChannel], so it can be used as a `Type` e.g. in isinstance() checks. But you must not rely on this, as we reserve the right to reserve a different kind of object in the future, which _only_ satisfies the two criteria (1.) and (2.) above without being a `Type` itself.
 
   Raises:
     EnvironmentError: if the current Python interpreter is not Python 3.
-  """
+  '''
   if func is None:
+    # Python decorators with arguments in parentheses result in two function
+    # calls. The first function call supplies the kwargs and the second supplies
+    # the decorated function. Here we forward the kwargs to the second call.
     return functools.partial(
-        component, component_annotation=component_annotation, use_beam=use_beam)
+        component,
+        component_annotation=component_annotation,
+        use_beam=use_beam,
+    )
 
   utils.assert_is_top_level_func(func)
 
@@ -433,7 +493,7 @@ def component(
                      'BeamComponentParameter[beam.Pipeline] with '
                      'default value None when use_beam=True.')
 
-  return utils.create_component_class(
+  component_class = utils.create_component_class(
       func=func,
       arg_defaults=arg_defaults,
       arg_formats=arg_formats,
@@ -456,3 +516,4 @@ def component(
       json_compatible_outputs=return_json_typehints,
       return_values_optionality=returned_values,
   )
+  return typing.cast(BaseFunctionalComponentFactory, component_class)

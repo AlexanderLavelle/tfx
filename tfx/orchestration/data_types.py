@@ -54,27 +54,6 @@ class ExecutionDecision:
     self.use_cached_results = use_cached_results
 
 
-class ExecutionInfo:
-  """ExecutionInfo contains information populated during execution phase.
-
-  Attributes:
-    input_dict: Updated key -> List of types.Artifact for inputs that was used
-      during the actual execution.
-    output_dict: Updated key -> List of types.Artifact for outputs that was
-      generated during the actual execution.
-    exec_properties: execution properties used in this execution.
-    execution_id: Registered execution_id for the execution.
-  """
-
-  def __init__(self, input_dict: Dict[str, List[types.Artifact]],
-               output_dict: Dict[str, List[types.Artifact]],
-               exec_properties: Dict[str, Any], execution_id: int):
-    self.input_dict = input_dict
-    self.output_dict = output_dict
-    self.exec_properties = exec_properties
-    self.execution_id = execution_id
-
-
 class DriverArgs:
   """Args to driver from orchestration system.
 
@@ -166,7 +145,7 @@ class ComponentInfo:
 class RuntimeParameter(json_utils.Jsonable):
   """Runtime parameter.
 
-  Currently only supported on KubeflowDagRunner.
+  Currently only supported on KubeflowV2DagRunner.
 
   For protos, use text type RuntimeParameter, which holds the proto json
   string, e.g., `'{"num_steps": 5}'` for TrainArgs proto.

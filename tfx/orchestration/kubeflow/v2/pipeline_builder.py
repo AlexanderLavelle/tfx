@@ -16,7 +16,8 @@
 import random
 import re
 import string
-from typing import Any, Dict, List, Optional, Union, Mapping
+import typing
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from absl import logging
 from kfp.pipeline_spec import pipeline_spec_pb2 as pipeline_pb2
@@ -28,6 +29,7 @@ from tfx.orchestration.kubeflow import utils
 from tfx.orchestration.kubeflow.v2 import compiler_utils
 from tfx.orchestration.kubeflow.v2 import parameter_utils
 from tfx.orchestration.kubeflow.v2 import step_builder
+from tfx.types import channel_utils
 
 from google.protobuf import json_format
 
@@ -83,25 +85,41 @@ def _check_default_image(default_image) -> None:
 class RuntimeConfigBuilder:
   """Kubeflow pipelines RuntimeConfig builder."""
 
-  def __init__(self, pipeline_info: data_types.PipelineInfo,
-               parameter_values: Dict[str, Any]):
+  def __init__(
+      self,
+      pipeline_info: data_types.PipelineInfo,
+      parameter_values: Dict[str, Any],
+      use_pipeline_spec_2_1: bool = False,
+  ):
     """Creates a RuntimeConfigBuilder object.
 
     Args:
       pipeline_info: a TFX pipeline info object, containing pipeline root info.
       parameter_values: mapping from runtime parameter names to its values.
+      use_pipeline_spec_2_1: Use the KFP pipeline spec schema 2.1 to support
+        Vertex ML pipeline teamplate gallary.
     """
     self._pipeline_root = pipeline_info.pipeline_root
     self._parameter_values = parameter_values or {}
+    self._use_pipeline_spec_2_1 = use_pipeline_spec_2_1
 
   def build(self) -> pipeline_pb2.PipelineJob.RuntimeConfig:
     """Build a RuntimeConfig proto."""
+    if self._use_pipeline_spec_2_1:
+      return pipeline_pb2.PipelineJob.RuntimeConfig(
+          gcs_output_directory=self._pipeline_root,
+          parameter_values={
+              k: compiler_utils.get_google_value(v)
+              for k, v in self._parameter_values.items()
+          },
+      )
     return pipeline_pb2.PipelineJob.RuntimeConfig(
         gcs_output_directory=self._pipeline_root,
         parameters={
             k: compiler_utils.get_kubeflow_value(v)
             for k, v in self._parameter_values.items()
-        })
+        },
+    )
 
 
 class PipelineBuilder:
@@ -116,6 +134,7 @@ class PipelineBuilder:
       default_image: Union[str, Mapping[str, str]],
       default_commands: Optional[List[str]] = None,
       exit_handler: Optional[base_node.BaseNode] = None,
+      use_pipeline_spec_2_1: bool = False,
   ):
     """Creates a PipelineBuilder object.
 
@@ -137,12 +156,23 @@ class PipelineBuilder:
         https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/#notes
       exit_handler: the optional custom component for post actions triggered
         after all pipeline tasks finish.
+      use_pipeline_spec_2_1: Use the KFP pipeline spec schema 2.1 to support
+        Vertex ML pipeline teamplate gallary.
     """
     self._pipeline_info = tfx_pipeline.pipeline_info
     self._pipeline = tfx_pipeline
     self._default_image = default_image
     self._default_commands = default_commands
     self._exit_handler = exit_handler
+    self._use_pipeline_spec_2_1 = use_pipeline_spec_2_1
+    if use_pipeline_spec_2_1:
+      self._parameter_type_spec_builder_func = (
+          compiler_utils.build_parameter_type_spec
+      )
+    else:
+      self._parameter_type_spec_builder_func = (
+          compiler_utils.build_parameter_type_spec_legacy
+      )
 
   def build(self) -> pipeline_pb2.PipelineSpec:
     """Build a pipeline PipelineSpec."""
@@ -157,14 +187,21 @@ class PipelineBuilder:
     self._pipeline.finalize()
 
     # Map from (upstream_node_id, output_key) to output_type (ValueArtifact)
-    dynamic_exec_properties = {}
+    dynamic_exec_properties: dict[tuple[str, str], str] = {}
     for component in self._pipeline.components:
       for name, value in component.exec_properties.items():
-
-        if isinstance(value, placeholder.ChannelWrappedPlaceholder):
-          node_id = value.channel.producer_component_id
-          dynamic_exec_properties[(
-              node_id, value.channel.output_key)] = value.channel.type.TYPE_NAME
+        if isinstance(value, placeholder.Placeholder):
+          try:
+            # This unwraps channel.future()[0].value and disallows any other
+            # placeholder expressions.
+            channel = channel_utils.unwrap_simple_channel_placeholder(value)
+          except ValueError as e:
+            raise ValueError(f'Invalid placeholder for exec prop {name}') from e
+          node_id = channel.producer_component_id
+          dynamic_exec_properties[
+              # The cast() is just to tell pytype that it's not None.
+              (node_id, typing.cast(str, channel.output_key))
+          ] = channel.type.TYPE_NAME
     tfx_tasks = {}
     component_defs = {}
     # Map from (producer component id, output key) to (new producer component
@@ -200,6 +237,7 @@ class PipelineBuilder:
             enable_cache=self._pipeline.enable_cache,
             pipeline_info=self._pipeline_info,
             channel_redirect_map=channel_redirect_map,
+            use_pipeline_spec_2_1=self._use_pipeline_spec_2_1,
         ).build()
         tfx_tasks.update(built_tasks)
 
@@ -214,6 +252,8 @@ class PipelineBuilder:
       exit_handler_image = _get_component_image(
           self._default_image, self._exit_handler.id
       )
+      with self._pipeline.dsl_context_registry.temporary_mutable():
+        self._pipeline.dsl_context_registry.put_node(self._exit_handler)
       # construct root with exit handler
       exit_handler_task = step_builder.StepBuilder(
           node=self._exit_handler,
@@ -228,6 +268,7 @@ class PipelineBuilder:
           pipeline_info=self._pipeline_info,
           channel_redirect_map=channel_redirect_map,
           is_exit_handler=True,
+          use_pipeline_spec_2_1=self._use_pipeline_spec_2_1,
       ).build()
       result.root.dag.tasks[
           utils.TFX_DAG_NAME].component_ref.name = utils.TFX_DAG_NAME
@@ -246,6 +287,7 @@ class PipelineBuilder:
     # Attach runtime parameter to root's input parameter
     for param in pc.parameters:
       result.root.input_definitions.parameters[param.name].CopyFrom(
-          compiler_utils.build_parameter_type_spec(param))
+          self._parameter_type_spec_builder_func(param)
+      )
 
     return result

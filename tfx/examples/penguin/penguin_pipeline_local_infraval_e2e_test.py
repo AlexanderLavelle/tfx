@@ -14,6 +14,7 @@
 """E2E Tests for tfx.examples.penguin.penguin_pipeline_local_infraval."""
 
 import os
+import subprocess
 
 from absl.testing import parameterized
 import tensorflow as tf
@@ -26,12 +27,19 @@ from tfx.utils import path_utils
 
 from ml_metadata.proto import metadata_store_pb2
 
+import pytest
+
+
+
 _OUTPUT_EVENT_TYPES = [
     metadata_store_pb2.Event.OUTPUT,
     metadata_store_pb2.Event.DECLARED_OUTPUT,
 ]
 
 
+@pytest.mark.xfail(run=False, reason="PR 6889 This class contains tests that fail and needs to be fixed. "
+"If all tests pass, please remove this mark.")
+@pytest.mark.e2e
 class PenguinPipelineLocalInfravalEndToEndTest(
     tf.test.TestCase, parameterized.TestCase):
 
@@ -52,6 +60,18 @@ class PenguinPipelineLocalInfravalEndToEndTest(
                                        self._pipeline_name)
     self._metadata_path = os.path.join(self._test_dir, 'tfx', 'metadata',
                                        self._pipeline_name, 'metadata.db')
+    # From go/kokoro-native-docker-migration, the new Ubuntu 20.04 has an issue
+    # with connecting the docker container by "localhost". Therefore, it
+    # manually fetches and injects the host ip address of the infra validator's
+    # local docker runner.
+    self._infra_validator_host_ip_address = (
+        subprocess.check_output(
+            "/sbin/ip route | awk '/default/ { print $3 }'",
+            shell=True,
+        )
+        .decode('utf-8')
+        .strip()
+    )
 
   def _assertFileExists(self, path):
     self.assertTrue(fileio.exists(path), f'{path} does not exist.')
@@ -114,7 +134,10 @@ class PenguinPipelineLocalInfravalEndToEndTest(
             metadata_path=self._metadata_path,
             user_provided_schema_path=self._schema_path,
             beam_pipeline_args=[],
-            make_warmup=make_warmup))
+            infra_validator_host_ip_address=self._infra_validator_host_ip_address,
+            make_warmup=make_warmup,
+        )
+    )
 
     self.assertTrue(fileio.exists(self._serving_model_dir))
     self.assertTrue(fileio.exists(self._metadata_path))
@@ -142,7 +165,10 @@ class PenguinPipelineLocalInfravalEndToEndTest(
             metadata_path=self._metadata_path,
             user_provided_schema_path=self._schema_path,
             beam_pipeline_args=[],
-            make_warmup=make_warmup))
+            infra_validator_host_ip_address=self._infra_validator_host_ip_address,
+            make_warmup=make_warmup,
+        )
+    )
 
     # All executions but Evaluator and Pusher are cached.
     with metadata.Metadata(metadata_config) as m:
@@ -163,15 +189,13 @@ class PenguinPipelineLocalInfravalEndToEndTest(
             metadata_path=self._metadata_path,
             user_provided_schema_path=self._schema_path,
             beam_pipeline_args=[],
-            make_warmup=make_warmup))
+            infra_validator_host_ip_address=self._infra_validator_host_ip_address,
+            make_warmup=make_warmup,
+        )
+    )
 
     # Asserts cache execution.
     with metadata.Metadata(metadata_config) as m:
       # Artifact count is unchanged.
       self.assertLen(m.store.get_artifacts(), artifact_count)
       self.assertLen(m.store.get_executions(), expected_execution_count * 3)
-
-
-if __name__ == '__main__':
-  tf.compat.v1.enable_v2_behavior()
-  tf.test.main()

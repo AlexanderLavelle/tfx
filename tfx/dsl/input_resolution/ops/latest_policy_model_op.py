@@ -12,20 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module for LatestPolicyModel operator."""
+
 import collections
 import enum
-
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 from tfx import types
 from tfx.dsl.input_resolution import resolver_op
 from tfx.dsl.input_resolution.ops import ops_utils
 from tfx.orchestration.portable.input_resolution import exceptions
+from tfx.orchestration.portable.input_resolution.mlmd_resolver import metadata_resolver
 from tfx.orchestration.portable.mlmd import event_lib
+from tfx.orchestration.portable.mlmd import filter_query_builder as q
 from tfx.types import artifact_utils
+from tfx.types import external_artifact_utils
 from tfx.utils import typing_utils
 
 from ml_metadata.proto import metadata_store_pb2
+
+# Valid artifact states for LatestPolicyModel.
+#
+# We include MARKED_FOR_DELETION and DELETED states, which correspond to garbage
+# collected artifacts. It is possible for the downstream
+# ModelBlessing/ModelInfraBlessing/ModelPush to be garbage colelcted, but this
+# doesn't mean that the Model wasn't blessed. We exclude ABANDONED, because that
+# state is used for output artifacts from failed or cancelled exceutions.
+_VALID_ARTIFACT_STATES = [
+    metadata_store_pb2.Artifact.State.LIVE,
+    metadata_store_pb2.Artifact.State.MARKED_FOR_DELETION,
+    metadata_store_pb2.Artifact.State.DELETED,
+]
 
 
 # TODO(kshivvy): Consider supporting LATEST_PUSHED_DIFFERENT_DATA and
@@ -52,28 +68,38 @@ class Policy(enum.IntEnum):
 class ModelRelations:
   """Stores child ModelBlessing, ModelInfraBlessing, ModelPush for a Model."""
 
-  model_blessing_by_artifact_id: Dict[int, types.Artifact]
-  infra_blessing_by_artifact_id: Dict[int, types.Artifact]
-  model_push_by_artifact_id: Dict[int, types.Artifact]
-
   def __init__(self):
-    self.model_blessing_by_artifact_id = {}
-    self.infra_blessing_by_artifact_id = {}
-    self.model_push_by_artifact_id = {}
+    self.model_blessing_artifacts: List[types.Artifact] = []
+    self.infra_blessing_artifacts: List[types.Artifact] = []
+    self.model_push_artifacts: List[types.Artifact] = []
+
+  def add_downstream_artifact(
+      self, downstream_artifact: metadata_store_pb2.Artifact
+  ):
+    """Adds a downstream artifact to the ModelRelations."""
+    artifact_type_name = downstream_artifact.type
+    if _is_eval_blessed(artifact_type_name, downstream_artifact):
+      self.model_blessing_artifacts.append(downstream_artifact)
+
+    elif _is_infra_blessed(artifact_type_name, downstream_artifact):
+      self.infra_blessing_artifacts.append(downstream_artifact)
+
+    elif artifact_type_name == ops_utils.MODEL_PUSH_TYPE_NAME:
+      self.model_push_artifacts.append(downstream_artifact)
 
   def meets_policy(self, policy: Policy) -> bool:
     """Checks if ModelRelations contains artifacts that meet the Policy."""
     if policy == Policy.LATEST_EXPORTED:
       return True
     elif policy == Policy.LATEST_PUSHED:
-      return bool(self.model_push_by_artifact_id)
+      return bool(self.model_push_artifacts)
     elif policy == Policy.LATEST_EVALUATOR_BLESSED:
-      return bool(self.model_blessing_by_artifact_id)
+      return bool(self.model_blessing_artifacts)
     elif policy == Policy.LATEST_INFRA_VALIDATOR_BLESSED:
-      return bool(self.infra_blessing_by_artifact_id)
+      return bool(self.infra_blessing_artifacts)
     elif policy == Policy.LATEST_BLESSED:
-      return bool(self.model_blessing_by_artifact_id) and bool(
-          self.infra_blessing_by_artifact_id
+      return bool(self.model_blessing_artifacts) and bool(
+          self.infra_blessing_artifacts
       )
 
     return False
@@ -83,11 +109,11 @@ class ModelRelations:
   ) -> types.Artifact:
     """Gets the latest created artifact with matching ArtifactType."""
     if artifact_type.name == ops_utils.MODEL_BLESSING_TYPE_NAME:
-      artifacts = self.model_blessing_by_artifact_id.values()
+      artifacts = self.model_blessing_artifacts
     elif artifact_type.name == ops_utils.MODEL_INFRA_BLESSSING_TYPE_NAME:
-      artifacts = self.infra_blessing_by_artifact_id.values()
+      artifacts = self.infra_blessing_artifacts
     elif artifact_type.name == ops_utils.MODEL_PUSH_TYPE_NAME:
-      artifacts = self.model_push_by_artifact_id.values()
+      artifacts = self.model_push_artifacts
     else:
       raise exceptions.InvalidArgument(
           'ModelRelations.latest_created() can only be called with an '
@@ -178,6 +204,33 @@ def _build_result_dictionary(
     ]
 
   return result
+
+
+def _dedpupe_model_artifacts(
+    models: Optional[List[artifact_utils.Artifact]],
+) -> Tuple[List[artifact_utils.Artifact], List[int]]:
+  """Dedupes a list of Model artifacts."""
+  if not models:
+    return [], []
+
+  model_by_external_id = {}
+  model_by_id = {}
+
+  for m in models:
+    if m.external_id:
+      model_by_external_id[m.external_id] = m
+    else:
+      model_by_id[m.id] = m
+
+  deduped_models = list(model_by_external_id.values()) + list(
+      model_by_id.values()
+  )
+  model_artifact_ids = [
+      external_artifact_utils.get_id_from_external_id(i)
+      for i in model_by_external_id.keys()
+  ] + list(model_by_id.keys())
+
+  return (deduped_models, model_artifact_ids)
 
 
 class LatestPolicyModel(
@@ -301,6 +354,25 @@ class LatestPolicyModel(
     if self.policy == Policy.LATEST_EXPORTED:
       return {ops_utils.MODEL_KEY: [models[0]]}
 
+    are_models_external = [m.is_external for m in models]
+    if any(are_models_external) and not all(are_models_external):
+      raise exceptions.InvalidArgument(
+          'Inputs to the LastestPolicyModel are from both current pipeline and'
+          ' external pipeline. LastestPolicyModel does not support such usage.'
+      )
+    if all(are_models_external):
+      pipeline_assets = set([
+          external_artifact_utils.get_pipeline_asset_from_external_id(
+              m.mlmd_artifact.external_id
+          )
+          for m in models
+      ])
+      if len(pipeline_assets) != 1:
+        raise exceptions.InvalidArgument(
+            'Input models to the LastestPolicyModel are from multiple'
+            ' pipelines. LastestPolicyModel does not support such usage.'
+        )
+
     # If ModelBlessing and/or ModelInfraBlessing artifacts were included in
     # input_dict, then we will only consider those child artifacts.
     specifies_child_artifacts = (
@@ -310,7 +382,17 @@ class LatestPolicyModel(
     input_child_artifacts = input_dict.get(
         ops_utils.MODEL_BLESSSING_KEY, []
     ) + input_dict.get(ops_utils.MODEL_INFRA_BLESSING_KEY, [])
-    input_child_artifact_ids = set([a.id for a in input_child_artifacts])
+
+    input_child_artifact_ids = set()
+    for a in input_child_artifacts:
+      if a.is_external:
+        input_child_artifact_ids.add(
+            external_artifact_utils.get_id_from_external_id(
+                a.mlmd_artifact.external_id
+            )
+        )
+      else:
+        input_child_artifact_ids.add(a.id)
 
     # If the ModelBlessing and ModelInfraBlessing lists are empty, then no
     # child artifacts can be considered and we raise a SkipSignal. This can
@@ -338,95 +420,95 @@ class LatestPolicyModel(
 
     # There could be multiple events with the same execution ID but different
     # artifact IDs (e.g. model and baseline_model passed to an Evaluator), so we
-    # keep the values of model_artifact_ids_by_execution_id as sets.
-    model_artifact_ids = sorted(set(m.id for m in models))
-    model_artifact_ids_by_execution_id = collections.defaultdict(set)
+    # need to deduplicate the Model artifacts.
+    deduped_models, model_artifact_ids = _dedpupe_model_artifacts(models)
 
-    # Pusher takes uses the key "model_export" to take in the Model artifact,
-    # but all other components use the key "model".
+    downstream_artifact_type_names_filter_query = q.to_sql_string([
+        ops_utils.MODEL_BLESSING_TYPE_NAME,
+        ops_utils.MODEL_INFRA_BLESSSING_TYPE_NAME,
+        ops_utils.MODEL_PUSH_TYPE_NAME,
+    ])
+    input_child_artifact_ids_filter_query = q.to_sql_string(
+        list(input_child_artifact_ids)
+    )
+
+    artifact_states_filter_query = (
+        ops_utils.get_valid_artifact_states_filter_query(_VALID_ARTIFACT_STATES)
+    )
+    filter_query = (
+        f'type IN {downstream_artifact_type_names_filter_query} AND '
+        f'{artifact_states_filter_query}'
+    )
+
+    if input_child_artifact_ids and specifies_child_artifacts:
+      filter_query = (
+          f'id IN {input_child_artifact_ids_filter_query} AND {filter_query}'
+      )
+
     if self.policy == Policy.LATEST_PUSHED:
       event_input_key = ops_utils.MODEL_EXPORT_KEY
     else:
       event_input_key = ops_utils.MODEL_KEY
 
-    # Get all Executions in MLMD associated with the Model artifacts.
-    execution_ids = set()
-    for event in self.context.store.get_events_by_artifact_ids(
-        model_artifact_ids
-    ):
-      if event_lib.is_valid_input_event(event, event_input_key):
-        model_artifact_ids_by_execution_id[event.execution_id].add(
-            event.artifact_id
-        )
-        execution_ids.add(event.execution_id)
+    # Define event filter for paths filtering, the logic is:
+    # An event considered as valid to be included the path if:
+    # 1. It's an input event and not connected to a Model artifact.
+    # 2. It's an input event with event_input_key and connected to a Model
+    # artifact.
+    # 3. It's an OUTPUT (not PENDING_OUTPUT) event.
+    def event_filter(event):
+      if event_lib.is_valid_input_event(event):
+        if event.artifact_id in model_artifact_ids:
+          return event_lib.is_valid_input_event(event, event_input_key)
+        else:
+          return True
+      else:
+        return event_lib.is_valid_output_event(event)
 
-    # Get all artifact ids associated with an OUTPUT Event in each Execution.
-    # These ids correspond to descendant artifacts 1 hop distance away from the
-    # Model.
-    child_artifact_ids = set()
-    child_artifact_ids_by_model_artifact_id = collections.defaultdict(set)
-    model_artifact_ids_by_child_artifact_id = collections.defaultdict(set)
-    for event in self.context.store.get_events_by_execution_ids(execution_ids):
-      if not event_lib.is_valid_output_event(event):
-        continue
-
-      child_artifact_id = event.artifact_id
-      # Only consider child artifacts present in input_dict, if specified.
-      if (
-          specifies_child_artifacts
-          and child_artifact_id not in input_child_artifact_ids
-      ):
-        continue
-
-      child_artifact_ids.add(child_artifact_id)
-      model_artifact_ids = model_artifact_ids_by_execution_id[
-          event.execution_id
-      ]
-      model_artifact_ids_by_child_artifact_id[child_artifact_id] = (
-          model_artifact_ids
-      )
-
-      for model_artifact_id in model_artifact_ids:
-        child_artifact_ids_by_model_artifact_id[model_artifact_id].add(
-            child_artifact_id
-        )
-
-    # Get Model, ModelBlessing, ModelInfraBlessing, and ModelPush ArtifactTypes.
-    artifact_type_by_type_id = {}
-    artifact_type_by_name = {}
-    for artifact_type in self.context.store.get_artifact_types():
-      artifact_type_by_type_id[artifact_type.id] = artifact_type
-      artifact_type_by_name[artifact_type.name] = artifact_type
-
+    mlmd_resolver = metadata_resolver.MetadataResolver(
+        self.context.store,
+        mlmd_connection_manager=self.context.mlmd_connection_manager,
+    )
     # Populate the ModelRelations associated with each Model artifact and its
     # children.
-    child_artifact_by_artifact_id = {}
-    model_relations_by_model_artifact_id = collections.defaultdict(
+    model_relations_by_model_identifier = collections.defaultdict(
         ModelRelations
     )
-    for artifact in self.context.store.get_artifacts_by_id(child_artifact_ids):
-      child_artifact_by_artifact_id[artifact.id] = artifact
-      for model_artifact_id in model_artifact_ids_by_child_artifact_id[
-          artifact.id
-      ]:
-        model_relations = model_relations_by_model_artifact_id[
-            model_artifact_id
-        ]
+    artifact_type_by_name: Dict[str, metadata_store_pb2.ArtifactType] = {}
 
-        artifact_type_name = artifact_type_by_type_id[artifact.type_id].name
-        if _is_eval_blessed(artifact_type_name, artifact):
-          model_relations.model_blessing_by_artifact_id[artifact.id] = artifact
+    # Split `model_artifact_ids` into batches with batch size = 100 while
+    # fetching downstream artifacts, because
+    # `get_downstream_artifacts_by_artifact_ids()` supports at most 100 ids
+    # as starting artifact ids.
+    for id_index in range(0, len(deduped_models), ops_utils.BATCH_SIZE):
+      batch_model_artifacts = deduped_models[
+          id_index : id_index + ops_utils.BATCH_SIZE
+      ]
+      # Set `max_num_hops` to 50, which should be enough for this use case.
+      batch_downstream_artifacts_and_types_by_model_identifier = (
+          mlmd_resolver.get_downstream_artifacts_by_artifacts(
+              batch_model_artifacts,
+              max_num_hops=ops_utils.LATEST_POLICY_MODEL_OP_MAX_NUM_HOPS,
+              filter_query=filter_query,
+              event_filter=event_filter,
+          )
+      )
 
-        elif _is_infra_blessed(artifact_type_name, artifact):
-          model_relations.infra_blessing_by_artifact_id[artifact.id] = artifact
-
-        elif artifact_type_name == ops_utils.MODEL_PUSH_TYPE_NAME:
-          model_relations.model_push_by_artifact_id[artifact.id] = artifact
+      for (
+          model_identifier,
+          artifacts_and_types,
+      ) in batch_downstream_artifacts_and_types_by_model_identifier.items():
+        for downstream_artifact, artifact_type in artifacts_and_types:
+          artifact_type_by_name[artifact_type.name] = artifact_type
+          model_relations_by_model_identifier[
+              model_identifier
+          ].add_downstream_artifact(downstream_artifact)
 
     # Find the latest model and ModelRelations that meets the Policy.
     result = {}
     for model in models:
-      model_relations = model_relations_by_model_artifact_id[model.id]
+      identifier = external_artifact_utils.identifier(model)
+      model_relations = model_relations_by_model_identifier[identifier]
       if model_relations.meets_policy(self.policy):
         result[ops_utils.MODEL_KEY] = [model]
         break

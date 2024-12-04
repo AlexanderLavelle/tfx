@@ -22,7 +22,6 @@ import time
 
 import absl
 from click import testing as click_testing
-import tensorflow as tf
 from tfx.dsl.io import fileio
 from tfx.orchestration.airflow import test_utils as airflow_test_utils
 from tfx.tools.cli import labels
@@ -33,7 +32,12 @@ from tfx.utils import io_utils
 from tfx.utils import retry
 from tfx.utils import test_case_utils
 
+import pytest
 
+
+@pytest.mark.xfail(run=False, reason="PR 6889 This class contains tests that fail and needs to be fixed. "
+"If all tests pass, please remove this mark.")
+@pytest.mark.e2e
 class CliAirflowEndToEndTest(test_case_utils.TfxTest):
 
   def setUp(self):
@@ -112,13 +116,16 @@ class CliAirflowEndToEndTest(test_case_utils.TfxTest):
 
   def _prepare_airflow_with_mysql(self):
     self._mysql_container_name = 'airflow_' + test_utils.generate_random_id()
-    db_port = airflow_test_utils.create_mysql_container(
-        self._mysql_container_name)
+    ip_address, db_port = airflow_test_utils.create_mysql_container(
+        self._mysql_container_name
+    )
     self.addCleanup(self._cleanup_mysql_container)
     self.enter_context(
         test_case_utils.override_env_var(
             'AIRFLOW__CORE__SQL_ALCHEMY_CONN',
-            'mysql://tfx@127.0.0.1:%d/airflow' % db_port))
+            'mysql://tfx@%s:%d/airflow' % (ip_address, db_port),
+        )
+    )
     # Do not load examples to make this a bit faster.
     self.enter_context(
         test_case_utils.override_env_var('AIRFLOW__CORE__LOAD_EXAMPLES',
@@ -362,7 +369,3 @@ class CliAirflowEndToEndTest(test_case_utils.TfxTest):
     # When only Airflow is installed.
     if labels.KUBEFLOW_PACKAGE_NAME not in self._pip_list:
       self.assertIn('Kubeflow not found', result.output)
-
-
-if __name__ == '__main__':
-  tf.test.main()

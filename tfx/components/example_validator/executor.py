@@ -23,14 +23,24 @@ from tfx.components.example_validator import labels
 from tfx.components.statistics_gen import stats_artifact_utils
 from tfx.components.util import value_utils
 from tfx.dsl.components.base import base_executor
+from tfx.proto.orchestration import execution_result_pb2
 from tfx.types import artifact_utils
 from tfx.types import standard_component_specs
 from tfx.utils import io_utils
 from tfx.utils import json_utils
 from tfx.utils import writer_utils
 
+from tensorflow_metadata.proto.v0 import anomalies_pb2
+
 # Default file name for anomalies output.
 DEFAULT_FILE_NAME = 'SchemaDiff.pb'
+
+# Keys for artifact (custom) properties.
+ARTIFACT_PROPERTY_BLESSED_KEY = 'blessed'
+
+# Values for blessing results.
+BLESSED_VALUE = 1
+NOT_BLESSED_VALUE = 0
 
 
 class Executor(base_executor.BaseExecutor):
@@ -38,7 +48,8 @@ class Executor(base_executor.BaseExecutor):
 
   def Do(self, input_dict: Dict[str, List[types.Artifact]],
          output_dict: Dict[str, List[types.Artifact]],
-         exec_properties: Dict[str, Any]) -> None:
+         exec_properties: Dict[str, Any]
+         ) -> execution_result_pb2.ExecutorOutput:
     """TensorFlow ExampleValidator executor entrypoint.
 
     This validates statistics against the schema.
@@ -60,7 +71,7 @@ class Executor(base_executor.BaseExecutor):
           custom validations with SQL.
 
     Returns:
-      None
+      ExecutionResult proto with anomalies
     """
     self._log_startup(input_dict, output_dict, exec_properties)
 
@@ -83,12 +94,14 @@ class Executor(base_executor.BaseExecutor):
         output_dict[standard_component_specs.ANOMALIES_KEY])
     anomalies_artifact.split_names = artifact_utils.encode_split_names(
         split_names)
+    anomalies_artifact.span = stats_artifact.span
 
     schema = io_utils.SchemaReader().read(
         io_utils.get_only_uri_in_dir(
             artifact_utils.get_single_uri(
                 input_dict[standard_component_specs.SCHEMA_KEY])))
 
+    blessed_value_dict = {}
     for split in artifact_utils.decode_split_names(stats_artifact.split_names):
       if split in exclude_splits:
         continue
@@ -110,12 +123,32 @@ class Executor(base_executor.BaseExecutor):
       output_uri = artifact_utils.get_split_uri(
           output_dict[standard_component_specs.ANOMALIES_KEY], split)
       label_outputs = {labels.SCHEMA_DIFF_PATH: output_uri}
-      self._Validate(label_inputs, label_outputs)
+
+      anomalies = self._Validate(label_inputs, label_outputs)
+      if anomalies.anomaly_info or anomalies.HasField('dataset_anomaly_info'):
+        blessed_value_dict[split] = NOT_BLESSED_VALUE
+      else:
+        blessed_value_dict[split] = BLESSED_VALUE
+
       logging.info(
           'Validation complete for split %s. Anomalies written to '
           '%s.', split, output_uri)
 
-  def _Validate(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
+      # Set blessed custom property for anomalies artifact.
+      anomalies_artifact.set_json_value_custom_property(
+          ARTIFACT_PROPERTY_BLESSED_KEY, blessed_value_dict
+      )
+
+    executor_output = execution_result_pb2.ExecutorOutput()
+    executor_output.output_artifacts[
+        standard_component_specs.ANOMALIES_KEY
+        ].artifacts.append(anomalies_artifact.mlmd_artifact)
+
+    return executor_output
+
+  def _Validate(
+      self, inputs: Dict[str, Any], outputs: Dict[str, Any]
+  ) -> anomalies_pb2.Anomalies:
     """Validate the inputs and put validate result into outputs.
 
       This is the implementation part of example validator executor. This is
@@ -142,6 +175,9 @@ class Executor(base_executor.BaseExecutor):
           external config file.
       outputs: A dictionary of labeled output values, including:
           - labels.SCHEMA_DIFF_PATH: the path to write the schema diff to
+
+    Returns:
+      An Anomalies proto containing anomalies for the split.
     """
     schema = value_utils.GetSoleValue(inputs,
                                       standard_component_specs.SCHEMA_KEY)
@@ -158,3 +194,4 @@ class Executor(base_executor.BaseExecutor):
     writer_utils.write_anomalies(
         os.path.join(schema_diff_path, DEFAULT_FILE_NAME), anomalies
     )
+    return anomalies

@@ -19,10 +19,8 @@ from typing import Any, Dict, List
 from absl import logging
 import apache_beam as beam
 import tensorflow_model_analysis as tfma
-from tensorflow_model_analysis import constants as tfma_constants
 # Need to import the following module so that the fairness indicator post-export
 # metric is registered.
-import tensorflow_model_analysis.addons.fairness.post_export_metrics.fairness_indicators  # pylint: disable=unused-import
 from tfx import types
 from tfx.components.evaluator import constants
 from tfx.components.util import udf_utils
@@ -41,7 +39,7 @@ _TELEMETRY_DESCRIPTORS = ['Evaluator']
 
 
 class Executor(base_beam_executor.BaseBeamExecutor):
-  """Executor for [Evaluator](https://www.tensorflow.org/tfx/guide/evaluator)."""
+  """Executor for [Evaluator](../../../guide/evaluator)."""
 
   def _get_slice_spec_from_feature_slicing_spec(
       self, spec: evaluator_pb2.FeatureSlicingSpec
@@ -103,16 +101,6 @@ class Executor(base_beam_executor.BaseBeamExecutor):
 
     self._log_startup(input_dict, output_dict, exec_properties)
 
-    # Add fairness indicator metric callback if necessary.
-    fairness_indicator_thresholds = json_utils.loads(
-        exec_properties.get(
-            standard_component_specs.FAIRNESS_INDICATOR_THRESHOLDS_KEY, 'null'))
-    add_metrics_callbacks = None
-    if fairness_indicator_thresholds:
-      add_metrics_callbacks = [
-          tfma.post_export_metrics.fairness_indicators(  # pytype: disable=module-attr
-              thresholds=fairness_indicator_thresholds),
-      ]
 
     output_uri = artifact_utils.get_single_uri(
         output_dict[constants.EVALUATION_KEY])
@@ -120,8 +108,10 @@ class Executor(base_beam_executor.BaseBeamExecutor):
     # Make sure user packages get propagated to the remote Beam worker.
     unused_module_path, extra_pip_packages = udf_utils.decode_user_module_key(
         exec_properties.get(standard_component_specs.MODULE_PATH_KEY, None))
+    local_pip_packages = []
     for pip_package_path in extra_pip_packages:
       local_pip_package_path = io_utils.ensure_local(pip_package_path)
+      local_pip_packages.append(local_pip_package_path)
       self._beam_pipeline_args.append('--extra_package=%s' %
                                       local_pip_package_path)
 
@@ -174,10 +164,14 @@ class Executor(base_beam_executor.BaseBeamExecutor):
           model_artifact = artifact_utils.get_single_instance(
               input_dict[standard_component_specs.MODEL_KEY])
         # TODO(b/171992041): tfma.get_model_type replaced by tfma.utils.
-        if ((hasattr(tfma, 'utils') and
-             tfma.utils.get_model_type(model_spec) == tfma.TF_ESTIMATOR) or
-            hasattr(tfma, 'get_model_type') and
-            tfma.get_model_type(model_spec) == tfma.TF_ESTIMATOR):
+        if (
+            (
+                hasattr(tfma, 'utils')
+                and tfma.utils.get_model_type(model_spec) == tfma.TFMA_EVAL
+            )
+            or hasattr(tfma, 'get_model_type')
+            and tfma.get_model_type(model_spec) == tfma.TFMA_EVAL
+        ):
           model_path = path_utils.eval_model_path(
               model_artifact.uri,
               path_utils.is_old_model_artifact(model_artifact))
@@ -191,7 +185,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
                 eval_saved_model_path=model_path,
                 model_name=model_spec.name,
                 eval_config=eval_config,
-                add_metrics_callbacks=add_metrics_callbacks))
+                add_metrics_callbacks=None))
     else:
       eval_config = None
       assert (standard_component_specs.FEATURE_SLICING_SPEC_KEY
@@ -214,7 +208,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
               eval_saved_model_path=model_path,
               model_name='',
               eval_config=None,
-              add_metrics_callbacks=add_metrics_callbacks))
+              add_metrics_callbacks=None))
 
     eval_shared_model = models[0] if len(models) == 1 else models
     schema = None
@@ -238,7 +232,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
     # may be created by the Beam multi-process DirectRunner) can find the
     # needed dependencies.
     # TODO(b/187122662): Move this to the ExecutorOperator or Launcher.
-    with udf_utils.TempPipInstallContext(extra_pip_packages):
+    with udf_utils.TempPipInstallContext(local_pip_packages):
       with self._make_beam_pipeline() as pipeline:
         examples_list = []
         tensor_adapter_config = None
@@ -248,7 +242,8 @@ class Executor(base_beam_executor.BaseBeamExecutor):
               examples=input_dict[standard_component_specs.EXAMPLES_KEY],
               telemetry_descriptors=_TELEMETRY_DESCRIPTORS,
               schema=schema,
-              raw_record_column_name=tfma_constants.ARROW_INPUT_COLUMN)
+              raw_record_column_name=tfma.constants.ARROW_INPUT_COLUMN,
+          )
           # TODO(b/161935932): refactor after TFXIO supports multiple patterns.
           for split in example_splits:
             split_uris = artifact_utils.get_split_uris(

@@ -14,11 +14,11 @@
 """Tests for tfx.dsl.context_managers.for_each."""
 import unittest
 
-import tensorflow as tf
 from tfx import types
 from tfx.dsl.components.base import base_node
 from tfx.dsl.context_managers import dsl_context_registry
 from tfx.dsl.control_flow import for_each
+from tfx.orchestration import pipeline as pipeline_lib
 from tfx.types import resolved_channel
 from tfx.utils import test_case_utils
 
@@ -94,15 +94,15 @@ class ForEachTest(test_case_utils.TfxTest):
     with self.subTest('Source channel is not a loop variable.'):
       with self.assertRaises(ValueError):
         a = A()
-        with for_each.ForEach(a.outputs['aa']) as aa:
-          b = B(aa=a.outputs['aa'])  # Should use loop var "aa" directly.
+        with for_each.ForEach(a.outputs['aa']) as aa: # noqa: F841
+          b = B(aa=a.outputs['aa'])  # Should use loop var "aa" directly. # noqa: F841
 
   def testForEach_MultipleNodes_NotImplemented(self):
     with self.assertRaises(NotImplementedError):
       a = A()
       with for_each.ForEach(a.outputs['aa']) as aa:
         b = B(aa=aa)
-        c = C(bb=b.outputs['bb'])  # pylint: disable=unused-variable
+        c = C(bb=b.outputs['bb'])  # noqa: F841
 
   def testForEach_NestedForEach_NotImplemented(self):
     with self.assertRaises(NotImplementedError):
@@ -110,7 +110,7 @@ class ForEachTest(test_case_utils.TfxTest):
       b = B()
       with for_each.ForEach(a.outputs['aa']) as aa:
         with for_each.ForEach(b.outputs['bb']) as bb:
-          c = C(aa=aa, bb=bb)  # pylint: disable=unused-variable
+          c = C(aa=aa, bb=bb)  # noqa: F841
 
   def testForEach_DifferentLoop_HasDifferentContext(self):
     a = A()
@@ -124,6 +124,11 @@ class ForEachTest(test_case_utils.TfxTest):
     context2 = dsl_context_registry.get().get_contexts(c2)[-1]
     self.assertNotEqual(context1, context2)
 
-
-if __name__ == '__main__':
-  tf.test.main()
+  def testForEach_Subpipeline(self):
+    a = A()
+    with for_each.ForEach(a.outputs['aa']) as aa:
+      p_in = pipeline_lib.PipelineInputs({'aa': aa})
+      b = B(aa=p_in.inputs['aa'])
+      pipeline_lib.Pipeline(
+          pipeline_name='foo', components=[b], inputs=p_in, outputs={}
+      )

@@ -16,6 +16,7 @@ import copy
 import sys
 from typing import Optional, cast
 
+from tfx import types
 from tfx.dsl.components.base import base_executor
 from tfx.dsl.io import fileio
 from tfx.orchestration.portable import base_executor_operator
@@ -31,6 +32,39 @@ from google.protobuf import message
 _STATEFUL_WORKING_DIR = 'stateful_working_dir'
 
 
+def hydrate_value_artifacts(input_artifacts: dict[str, list[types.Artifact]]):
+  """Reads value of ValueArtifacts into memory."""
+  for _, artifact_list in input_artifacts.items():
+    for artifact in artifact_list:
+      if isinstance(artifact, ValueArtifact):
+        # Read ValueArtifact into memory.
+        artifact.read()
+
+
+def construct_executor_output(
+    execution_info: data_types.ExecutionInfo,
+    output_dict: dict[str, list[types.Artifact]],
+) -> execution_result_pb2.ExecutorOutput:
+  """Constructs final executor output."""
+  # If result is not returned from the Do function, then try to
+  # read from the executor_output_uri.
+  if fileio.exists(execution_info.execution_output_uri):
+    return execution_result_pb2.ExecutorOutput.FromString(
+        fileio.open(execution_info.execution_output_uri, 'rb').read()
+    )
+  else:
+    # Old style TFX executor doesn't return executor_output, but modify
+    # output_dict and exec_properties in place. For backward compatibility,
+    # we use their executor_output and exec_properties to construct
+    # ExecutorOutput.
+    result = execution_result_pb2.ExecutorOutput()
+    outputs_utils.populate_output_artifact(result, output_dict)
+    outputs_utils.populate_exec_properties(
+        result, execution_info.exec_properties
+    )
+    return result
+
+
 def run_with_executor(
     execution_info: data_types.ExecutionInfo,
     executor: base_executor.BaseExecutor
@@ -44,35 +78,15 @@ def run_with_executor(
   Returns:
     The output from executor.
   """
-  # In cases where output directories are not empty due to a previous or
-  # unrelated execution, clear the directories to ensure consistency.
-  outputs_utils.clear_output_dirs(execution_info.output_dict)
-
-  for _, artifact_list in execution_info.input_dict.items():
-    for artifact in artifact_list:
-      if isinstance(artifact, ValueArtifact):
-        # Read ValueArtifact into memory.
-        artifact.read()
+  hydrate_value_artifacts(execution_info.input_dict)
 
   output_dict = copy.deepcopy(execution_info.output_dict)
-  result = executor.Do(execution_info.input_dict, output_dict,
-                       execution_info.exec_properties)
-  if not result:
-    # If result is not returned from the Do function, then try to
-    # read from the executor_output_uri.
-    if fileio.exists(execution_info.execution_output_uri):
-      result = execution_result_pb2.ExecutorOutput.FromString(
-          fileio.open(execution_info.execution_output_uri, 'rb').read())
-    else:
-      # Old style TFX executor doesn't return executor_output, but modify
-      # output_dict and exec_properties in place. For backward compatibility,
-      # we use their executor_output and exec_properties to construct
-      # ExecutorOutput.
-      result = execution_result_pb2.ExecutorOutput()
-      outputs_utils.populate_output_artifact(result, output_dict)
-      outputs_utils.populate_exec_properties(result,
-                                             execution_info.exec_properties)
-  return result
+  result = executor.Do(
+      execution_info.input_dict, output_dict, execution_info.exec_properties
+  )
+  if result:
+    return result
+  return construct_executor_output(execution_info, output_dict)
 
 
 class PythonExecutorOperator(base_executor_operator.BaseExecutorOperator):
@@ -92,16 +106,18 @@ class PythonExecutorOperator(base_executor_operator.BaseExecutorOperator):
 
   def __init__(self,
                executor_spec: message.Message,
-               platform_config: Optional[message.Message] = None):
+               platform_config: Optional[message.Message] = None,
+               pipeline_platform_config: Optional[message.Message] = None):
     """Initializes a PythonExecutorOperator.
 
     Args:
       executor_spec: The specification of how to initialize the executor.
       platform_config: The specification of how to allocate resource for the
         executor.
+      pipeline_platform_config: Pipeline-level context information.
     """
     # Python executors run locally, so platform_config is not used.
-    del platform_config
+    del platform_config, pipeline_platform_config
     super().__init__(executor_spec)
     python_class_executor_spec = cast(
         executable_spec_pb2.PythonClassExecutableSpec, self._executor_spec)

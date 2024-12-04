@@ -12,20 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for tfx.orchestration.portable.output_utils."""
+
 import os
 from unittest import mock
 
 from absl.testing import parameterized
-import tensorflow as tf
 from tfx.dsl.io import fileio
+from tfx.orchestration import data_types_utils
+from tfx.orchestration.portable import data_types
 from tfx.orchestration.portable import outputs_utils
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.proto.orchestration import pipeline_pb2
+from tfx.types import artifact as tfx_artifact
 from tfx.types import standard_artifacts
 from tfx.types.value_artifact import ValueArtifact
 from tfx.utils import test_case_utils
 
 from google.protobuf import text_format
+from ml_metadata.proto import metadata_store_pb2
 
 _PIPELINE_INFO = text_format.Parse("""
   id: "test_pipeline"
@@ -218,6 +222,19 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         'test_run_0')
     self._pipeline_runtime_spec = pipeline_runtime_spec
     self._pipeline_root = self.tmp_dir
+    self._mocked_stateful_working_index = 'mocked-index-123'
+    self._dummy_execution = metadata_store_pb2.Execution(
+        id=1,
+        type_id=1,
+        name='dummy_execution',
+        last_known_state=metadata_store_pb2.Execution.State.RUNNING,
+    )
+    data_types_utils.set_metadata_value(
+        self._dummy_execution.custom_properties[
+            outputs_utils._STATEFUL_WORKING_DIR_INDEX
+        ],
+        self._mocked_stateful_working_index,
+    )
 
   def _output_resolver(self, execution_mode=pipeline_pb2.Pipeline.SYNC):
     return outputs_utils.OutputsResolver(
@@ -330,6 +347,18 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     self.assertEqual(artifact_7.uri, outputs_utils.RESOLVED_AT_RUNTIME)
     self.assertTrue(artifact_7.is_external)
 
+  def testGetExecutorOutputDir(self):
+    execution_info = data_types.ExecutionInfo(
+        execution_output_uri=self._output_resolver().get_executor_output_uri(1)
+    )
+    executor_output_dir = outputs_utils.get_executor_output_dir(execution_info)
+
+    self.assertRegex(
+        executor_output_dir, '.*/test_node/.system/executor_execution/1$'
+    )
+
+    self.assertTrue(fileio.isdir(executor_output_dir))
+
   def testGetExecutorOutputUri(self):
     executor_output_uri = self._output_resolver().get_executor_output_uri(1)
     self.assertRegex(
@@ -342,25 +371,15 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
 
   def testGetStatefulWorkingDir(self):
     stateful_working_dir = (
-        self._output_resolver().get_stateful_working_directory())
-    self.assertRegex(stateful_working_dir,
-                     '.*/test_node/.system/stateful_working_dir/test_run_0')
+        self._output_resolver().get_stateful_working_directory(
+            self._dummy_execution
+        )
+    )
+    self.assertRegex(
+        stateful_working_dir,
+        f'.*/test_node/.system/stateful_working_dir/{self._mocked_stateful_working_index}',
+    )
     self.assertTrue(fileio.exists(stateful_working_dir))
-
-  @parameterized.parameters(pipeline_pb2.Pipeline.SYNC,
-                            pipeline_pb2.Pipeline.ASYNC)
-  def testGetStatefulWorkingDirWithExecutionId(self, exec_mode):
-    stateful_working_dir = (
-        self._output_resolver(exec_mode).get_stateful_working_directory(1))
-    self.assertRegex(stateful_working_dir,
-                     '.*/test_node/.system/stateful_working_dir/1')
-    fileio.exists(stateful_working_dir)
-
-  def testGetStatefulWorkingDirAsyncRaisesWithoutExecutionId(self):
-    with self.assertRaisesRegex(ValueError,
-                                'Cannot create stateful working dir'):
-      self._output_resolver(
-          pipeline_pb2.Pipeline.ASYNC).get_stateful_working_directory()
 
   def testGetTmpDir(self):
     tmp_dir = self._output_resolver().make_tmp_dir(1)
@@ -382,14 +401,6 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
           with fileio.open(os.path.join(artifact.uri, 'output'), 'w') as f:
             f.write('')
         self.assertTrue(fileio.exists(artifact.uri))
-
-    outputs_utils.clear_output_dirs(output_artifacts)
-    for _, artifact_list in output_artifacts.items():
-      for artifact in artifact_list:
-        if artifact.is_external:
-          continue
-        if not isinstance(artifact, ValueArtifact):
-          self.assertEqual(fileio.listdir(artifact.uri), [])
 
     outputs_utils.remove_output_dirs(output_artifacts)
     for _, artifact_list in output_artifacts.items():
@@ -451,18 +462,6 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
                            'w') as f:
             f.write('test')
 
-    outputs_utils.clear_output_dirs(external_artifacts)
-    for _, artifact_list in external_artifacts.items():
-      for artifact in artifact_list:
-        # clear_output_dirs method doesn't affect the external uris.
-        if isinstance(artifact, ValueArtifact):
-          with fileio.open(artifact.uri, 'r') as f:
-            self.assertEqual(f.read(), 'test')
-        else:
-          with fileio.open(os.path.join(artifact.uri, 'output'),
-                           'r') as f:
-            self.assertEqual(f.read(), 'test')
-
     outputs_utils.remove_output_dirs(external_artifacts)
     for _, artifact_list in external_artifacts.items():
       for artifact in artifact_list:
@@ -471,7 +470,10 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
 
   def testRemoveStatefulWorkingDirSucceeded(self):
     stateful_working_dir = (
-        self._output_resolver().get_stateful_working_directory())
+        self._output_resolver().get_stateful_working_directory(
+            self._dummy_execution
+        )
+    )
     self.assertTrue(fileio.exists(stateful_working_dir))
 
     outputs_utils.remove_stateful_working_dir(stateful_working_dir)
@@ -479,13 +481,16 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
 
   def testRemoveStatefulWorkingDirNotFoundError(self):
     # removing a nonexisting path is an noop
-    outputs_utils.remove_stateful_working_dir('/a/not/exist/path')
+    outputs_utils.remove_stateful_working_dir(
+        '/a/not/exist/path/.system/stateful_working_dir/123'
+    )
 
   @mock.patch.object(fileio, 'rmtree')
   def testRemoveStatefulWorkingDirOtherError(self, rmtree_fn):
     rmtree_fn.side_effect = ValueError('oops')
     with self.assertRaisesRegex(ValueError, 'oops'):
-      outputs_utils.remove_stateful_working_dir('/a/fake/path')
+      outputs_utils.remove_stateful_working_dir(
+          '/a/not/exist/path/.system/stateful_working_dir/123')
 
   def testPopulateOutputArtifact(self):
     executor_output = execution_result_pb2.ExecutorOutput()
@@ -522,37 +527,6 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
         }
         """, executor_output)
 
-  def testInvalidExternalUris(self):
-    external_artifact_uri = os.path.join(self._pipeline_root,
-                                         'node/execution/1')
-    invalid_pipeline_node = text_format.Parse(
-        f"""
-  node_info {{
-    id: "test_node"
-  }}
-  outputs {{
-    outputs {{
-      key: "invalid_output"
-      value {{
-        artifact_spec {{
-          type {{
-            id: 1
-            name: "String"
-          }}
-          external_artifact_uris: "{external_artifact_uri}"
-        }}
-      }}
-    }}
- }}
-""", pipeline_pb2.PipelineNode())
-    with self.assertRaisesRegex(
-        ValueError, 'is not allowed within the pipeline base directory.'):
-      outputs_utils.OutputsResolver(
-          pipeline_node=invalid_pipeline_node,
-          pipeline_info=_PIPELINE_INFO,
-          pipeline_runtime_spec=self._pipeline_runtime_spec
-      ).generate_output_artifacts(1)
-
   def testGetOrchestratorGeneratedBclDir(self):
     expected_bcl_dir = os.path.join(
         self.tmp_dir, 'test_node/.system/orchestrator_generated_bcl'
@@ -564,6 +538,41 @@ class OutputUtilsTest(test_case_utils.TfxTest, parameterized.TestCase):
     self.assertEqual(actual_bcl_dir, expected_bcl_dir)
     self.assertTrue(fileio.exists(actual_bcl_dir))
 
+  def testIntermediateArtifactState(self):
+    pipeline_node = text_format.Parse(
+        """
+    node_info {
+      id: "test_node"
+    }
+    outputs {
+      outputs {
+        key: "checkpoint_model"
+        value {
+          artifact_spec {
+            type {
+              id: 1
+              name: "CheckpointModel"
+            }
+            is_async: True
+          }
+        }
+      }
+  }
+  """,
+        pipeline_pb2.PipelineNode(),
+    )
 
-if __name__ == '__main__':
-  tf.test.main()
+    outputs_resolver = outputs_utils.OutputsResolver(
+        pipeline_node=pipeline_node,
+        pipeline_info=_PIPELINE_INFO,
+        pipeline_runtime_spec=self._pipeline_runtime_spec,
+    )
+    artifacts = outputs_resolver.generate_output_artifacts(1)
+
+    self.assertLen(artifacts, 1)
+    self.assertIn('checkpoint_model', artifacts)
+    self.assertLen(artifacts['checkpoint_model'], 1)
+    self.assertEqual(
+        artifacts['checkpoint_model'][0].state,
+        tfx_artifact.ArtifactState.REFERENCE,
+    )

@@ -56,8 +56,8 @@ class Executor(base_executor.BaseExecutor):
   https://github.com/tensorflow/tfx/blob/master/tfx/examples/chicago_taxi_pipeline/taxi_pipeline_simple.py#L104.
 
   For more details on tf.serving itself, please refer to
-  https://tensorflow.org/tfx/guide/pusher.  For a tutuorial on TF Serving,
-  please refer to https://www.tensorflow.org/tfx/guide/serving.
+  [the pusher guide](../../../guide/pusher). For a tutuorial on TF Serving,
+  please refer to [the serving guide](../../../guide/serving).
   """
 
   def CheckBlessing(self, input_dict: Dict[str, List[types.Artifact]]) -> bool:
@@ -223,11 +223,11 @@ class Executor(base_executor.BaseExecutor):
                   model_push: types.Artifact,
                   pushed_destination: str,
                   pushed_version: Optional[str] = None) -> None:
-    model_push.set_int_custom_property('pushed', 1)
+    model_push.set_int_custom_property(_PUSHED_KEY, 1)
     model_push.set_string_custom_property(
         _PUSHED_DESTINATION_KEY, pushed_destination)
     if pushed_version is not None:
       model_push.set_string_custom_property(_PUSHED_VERSION_KEY, pushed_version)
 
   def _MarkNotPushed(self, model_push: types.Artifact):
-    model_push.set_int_custom_property('pushed', 0)
+    model_push.set_int_custom_property(_PUSHED_KEY, 0)
