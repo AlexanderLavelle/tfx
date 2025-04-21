@@ -132,18 +132,18 @@ def dict_to_example(instance: Dict[str, Any]) -> example_pb2.Example:
       feature[key] = pyval_to_feature(pyval)
     else:
       raise RuntimeError(f'Value type {type(value[0])} is not supported.')
-    
+
   feature_lists = {
-    k:v for k,v in feature.items() 
+    k:v for k,v in feature.items()
     if isinstance(v, feature_pb2.FeatureList)
   }
 
   if not feature_lists:
     return example_pb2.Example(features=feature_pb2.Features(feature=feature))
-  else: 
+  else:
     for k in feature_lists.keys():
       feature.remove(k)
-    
+
     context = feature_pb2.Features(feature=feature)
     feature_lists = feature_pb2.FeatureLists(feature_list=feature_lists)
 
